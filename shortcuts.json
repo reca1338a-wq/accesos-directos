@@ -1,0 +1,16 @@
+{
+  "shortcuts": [
+    {
+      "name": "Documentos",
+      "path": "C:\\Users\\manuel\\Documents"
+    },
+    {
+      "name": "Escritorio",
+      "path": "C:\\Users\\manuel\\Desktop"
+    },
+    {
+      "name": "Descargas",
+      "path": "C:\\Users\\manuel\\Downloads"
+    }
+  ]
+}
