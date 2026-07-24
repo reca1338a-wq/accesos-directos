@@ -602,8 +602,37 @@ class AccesosDirectosApp:
         def dismiss() -> None:
             toast.destroy()
 
-        ttk.Button(buttons, text="Actualizar", command=install_now).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="Más tarde", command=dismiss).pack(side="left")
+        tk.Button(
+            buttons,
+            text="Actualizar",
+            command=install_now,
+            font=("Segoe UI", 9, "bold"),
+            fg=COLORS["bg"],
+            bg=COLORS["accent"],
+            activeforeground=COLORS["bg"],
+            activebackground="#b4befe",
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            borderwidth=0,
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            buttons,
+            text="Más tarde",
+            command=dismiss,
+            font=("Segoe UI", 9),
+            fg=COLORS["text"],
+            bg=COLORS["surface_hover"],
+            activeforeground=COLORS["text"],
+            activebackground=COLORS["surface_hover"],
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            borderwidth=0,
+        ).pack(side="left")
 
         def auto_close() -> None:
             try:
