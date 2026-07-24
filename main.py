@@ -20,7 +20,7 @@ from app_config import (
     save_settings,
     save_shortcuts,
 )
-from github_updates import UpdateError, apply_update, check_for_updates
+from github_updates import UpdateError, apply_update, check_for_updates, restart_with_update
 
 COLORS = {
     "bg": "#1e1e2e",
@@ -509,13 +509,13 @@ class AccesosDirectosApp:
                     "Tus accesos directos no se modificarán.",
                 )
                 if install:
-                    self._install_update(update.download_url, token)
+                    self._install_update(update, token)
 
             self.root.after(0, prompt_install)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _install_update(self, download_url: str, token: str) -> None:
+    def _install_update(self, update, token: str) -> None:
         progress = tk.Toplevel(self.root)
         progress.title("Actualizando...")
         progress.configure(bg=COLORS["bg"])
@@ -531,7 +531,7 @@ class AccesosDirectosApp:
 
         def worker() -> None:
             try:
-                apply_update(download_url, token)
+                apply_update(update.download_url, token, update.latest_version)
             except UpdateError as exc:
                 self.root.after(0, lambda: progress.destroy())
                 self.root.after(0, lambda: messagebox.showerror("Error de actualización", str(exc)))
@@ -546,7 +546,7 @@ class AccesosDirectosApp:
                     "¿Reiniciar ahora para aplicar los cambios?",
                 )
                 if restart:
-                    os.execv(sys.executable, [sys.executable, *sys.argv])
+                    restart_with_update()
 
             self.root.after(0, done)
 

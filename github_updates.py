@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -12,7 +15,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from app_config import APP_DIR, get_app_version
+from app_config import APP_DIR, VERSION_FILE, get_app_version
 
 UPDATE_FILES = ("main.py", "iniciar.bat", "VERSION", "app_config.py", "github_updates.py")
 
@@ -80,17 +83,22 @@ def check_for_updates(owner: str, repo: str, token: str = "") -> UpdateInfo | No
     if not is_newer_version(current, latest):
         return None
 
+    frozen = getattr(sys, "frozen", False)
+    wanted_suffix = ".exe" if frozen else ".zip"
     download_url = ""
     for asset in release.get("assets", []):
-        if asset.get("name", "").lower().endswith(".zip"):
+        if asset.get("name", "").lower().endswith(wanted_suffix):
             download_url = asset.get("browser_download_url", "")
             break
 
-    if not download_url:
+    if not download_url and not frozen:
         download_url = release.get("zipball_url", "")
 
     if not download_url:
-        raise UpdateError("No se encontró un archivo ZIP en la release más reciente.")
+        raise UpdateError(
+            "No se encontró en la release un archivo compatible "
+            f"({wanted_suffix}). Revisa que hayas subido ese tipo de archivo al Release."
+        )
 
     return UpdateInfo(
         current_version=current,
@@ -99,6 +107,79 @@ def check_for_updates(owner: str, repo: str, token: str = "") -> UpdateInfo | No
         download_url=download_url,
     )
 
+
+def apply_update(download_url: str, token: str = "", latest_version: str = "") -> None:
+    """Descarga e instala la actualización. Se adapta según si es .exe o .py sueltos."""
+    if getattr(sys, "frozen", False):
+        _apply_update_exe(download_url, token, latest_version)
+    else:
+        _apply_update_source(download_url, token)
+
+
+# ---------------------------------------------------------------------------
+# Modo .exe (aplicación empaquetada con PyInstaller)
+# ---------------------------------------------------------------------------
+
+def _apply_update_exe(download_url: str, token: str = "", latest_version: str = "") -> None:
+    """Descarga el nuevo .exe junto al actual, listo para sustituirlo al reiniciar."""
+    headers = {"User-Agent": "AccesosDirectos-Updater"}
+    if token.strip():
+        headers["Authorization"] = f"Bearer {token.strip()}"
+
+    request = urllib.request.Request(download_url, headers=headers)
+    current_exe = Path(sys.executable).resolve()
+    new_exe = current_exe.with_name(current_exe.stem + "_nuevo.exe")
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, new_exe.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+    except Exception as exc:
+        new_exe.unlink(missing_ok=True)
+        raise UpdateError(f"No se pudo descargar la actualización: {exc}") from exc
+
+    # Actualizamos ya el número de versión mostrado, aunque el .exe se
+    # sustituya realmente al reiniciar.
+    if latest_version:
+        try:
+            VERSION_FILE.write_text(latest_version.lstrip("vV") + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def restart_with_update() -> None:
+    """Sustituye el .exe actual por el descargado (si lo hay) y reinicia la app."""
+    if not getattr(sys, "frozen", False):
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+        return
+
+    current_exe = Path(sys.executable).resolve()
+    new_exe = current_exe.with_name(current_exe.stem + "_nuevo.exe")
+
+    if not new_exe.exists():
+        # No hay actualización pendiente, reinicio normal.
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+        return
+
+    # En Windows no se puede sobrescribir un .exe mientras se está ejecutando,
+    # así que dejamos un script que espera a que cerremos, hace el cambio y
+    # vuelve a abrir la app.
+    updater = current_exe.with_name("_actualizar.bat")
+    updater.write_text(
+        "@echo off\n"
+        "timeout /t 2 /nobreak >nul\n"
+        f'del "{current_exe}"\n'
+        f'move /y "{new_exe}" "{current_exe}"\n'
+        f'start "" "{current_exe}"\n'
+        'del "%~f0"\n',
+        encoding="utf-8",
+    )
+    subprocess.Popen(["cmd", "/c", str(updater)], creationflags=subprocess.CREATE_NO_WINDOW)
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Modo fuente (ejecutando con iniciar.bat / python main.py, sin compilar)
+# ---------------------------------------------------------------------------
 
 def _download_release_zip(download_url: str, token: str = "") -> Path:
     headers = {"User-Agent": "AccesosDirectos-Updater"}
@@ -129,7 +210,7 @@ def _find_repo_root(extracted_dir: Path) -> Path:
     return extracted_dir
 
 
-def apply_update(download_url: str, token: str = "") -> None:
+def _apply_update_source(download_url: str, token: str = "") -> None:
     zip_path = _download_release_zip(download_url, token)
     temp_dir = Path(tempfile.mkdtemp())
 

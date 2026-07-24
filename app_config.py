@@ -5,13 +5,25 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
+
+def _get_app_dir() -> Path:
+    # Cuando se ejecuta como .exe (PyInstaller), __file__ apunta a una
+    # carpeta temporal que se borra al cerrar. Usamos la carpeta donde
+    # vive el propio .exe para que VERSION y demás persistan entre
+    # ejecuciones y se puedan actualizar.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = _get_app_dir()
 VERSION_FILE = APP_DIR / "VERSION"
 LEGACY_SHORTCUTS_PATH = APP_DIR / "shortcuts.json"
 
-if __import__("sys").platform == "win32":
+if sys.platform == "win32":
     USER_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "AccesosDirectos"
 else:
     USER_DATA_DIR = Path.home() / ".config" / "accesos-directos"
@@ -36,6 +48,16 @@ DEFAULT_SHORTCUTS = [
 
 
 def get_app_version() -> str:
+    if not VERSION_FILE.exists():
+        # Primera ejecución del .exe: copiamos el VERSION que va
+        # empaquetado dentro del ejecutable (carpeta temporal _MEIPASS).
+        bundled = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "VERSION"
+        if bundled.exists():
+            try:
+                shutil.copy2(bundled, VERSION_FILE)
+            except OSError:
+                pass
+
     if VERSION_FILE.exists():
         return VERSION_FILE.read_text(encoding="utf-8").strip()
     return "0.0.0"
