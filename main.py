@@ -10,6 +10,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from app_config import (
+    GITHUB_OWNER,
+    GITHUB_REPO,
+    GITHUB_TOKEN,
     SHORTCUTS_PATH,
     USER_DATA_DIR,
     export_shortcuts,
@@ -31,6 +34,11 @@ COLORS = {
     "text_muted": "#a6adc8",
     "danger": "#f38ba8",
 }
+
+# Cada cuánto se comprueba si hay una versión nueva en segundo plano.
+# 15 minutos es un buen equilibrio: GitHub permite 60 peticiones/hora sin
+# token, así que esto solo gasta 4 y detecta actualizaciones con rapidez.
+UPDATE_CHECK_INTERVAL_MS = 15 * 60 * 1000
 
 
 def open_path(path: str) -> None:
@@ -116,19 +124,28 @@ class AccesosDirectosApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Accesos Directos")
-        self.root.geometry("720x520")
+        self.root.geometry("720x540")
         self.root.minsize(480, 360)
         self.root.configure(bg=COLORS["bg"])
 
         self.settings = load_settings()
         self.shortcuts = load_shortcuts()
         self._update_running = False
+        self._pending_update = None
 
         self._build_ui()
         self.refresh_buttons()
-        self.root.after(800, self._maybe_check_updates_on_startup)
+
+        self.root.after(1500, self._maybe_check_updates_on_startup)
+        self.root.after(UPDATE_CHECK_INTERVAL_MS, self._auto_check_loop)
+
+    # ------------------------------------------------------------------
+    # Construcción de la interfaz
+    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        self._build_menu()
+
         header = tk.Frame(self.root, bg=COLORS["bg"], padx=20, pady=16)
         header.pack(fill="x")
 
@@ -151,6 +168,8 @@ class AccesosDirectosApp:
             bg=COLORS["bg"],
         ).pack(side="left", padx=(10, 0), pady=(6, 0))
 
+        self._build_update_icon(title_row)
+
         tk.Label(
             header,
             text="Clic para abrir · Clic derecho para más opciones",
@@ -159,8 +178,11 @@ class AccesosDirectosApp:
             bg=COLORS["bg"],
         ).pack(anchor="w", pady=(4, 0))
 
+        # Línea separadora sutil bajo la cabecera.
+        tk.Frame(self.root, bg=COLORS["surface"], height=1).pack(fill="x", padx=20)
+
         toolbar = tk.Frame(self.root, bg=COLORS["bg"], padx=20)
-        toolbar.pack(fill="x", pady=(0, 4))
+        toolbar.pack(fill="x", pady=(14, 10))
 
         ttk.Style().theme_use("clam")
         style = ttk.Style()
@@ -169,29 +191,14 @@ class AccesosDirectosApp:
             background=COLORS["accent"],
             foreground=COLORS["bg"],
             font=("Segoe UI", 10, "bold"),
-            padding=(12, 8),
+            padding=(14, 9),
+            borderwidth=0,
         )
         style.map("Accent.TButton", background=[("active", "#b4befe")])
 
-        ttk.Button(toolbar, text="+ Añadir", style="Accent.TButton", command=self.add_shortcut).pack(
-            side="left", padx=(0, 8)
-        )
-        ttk.Button(toolbar, text="Importar", command=self.import_shortcuts_dialog).pack(
-            side="left", padx=(0, 8)
-        )
-        ttk.Button(toolbar, text="Exportar", command=self.export_shortcuts_dialog).pack(
-            side="left", padx=(0, 8)
-        )
-        ttk.Button(toolbar, text="Editar lista", command=self.edit_config).pack(side="left", padx=(0, 8))
-        ttk.Button(toolbar, text="Recargar", command=self.reload).pack(side="left")
-
-        toolbar2 = tk.Frame(self.root, bg=COLORS["bg"], padx=20)
-        toolbar2.pack(fill="x", pady=(0, 8))
-
-        ttk.Button(toolbar2, text="Buscar actualizaciones", command=self.check_updates_dialog).pack(
-            side="left", padx=(0, 8)
-        )
-        ttk.Button(toolbar2, text="Configuración", command=self.open_settings_dialog).pack(side="left")
+        ttk.Button(
+            toolbar, text="+  Añadir acceso", style="Accent.TButton", command=self.add_shortcut
+        ).pack(side="left")
 
         canvas_frame = tk.Frame(self.root, bg=COLORS["bg"], padx=20, pady=8)
         canvas_frame.pack(fill="both", expand=True)
@@ -223,8 +230,92 @@ class AccesosDirectosApp:
             justify="left",
         ).pack(anchor="w")
 
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Añadir acceso...", command=self.add_shortcut)
+        file_menu.add_separator()
+        file_menu.add_command(label="Importar...", command=self.import_shortcuts_dialog)
+        file_menu.add_command(label="Exportar...", command=self.export_shortcuts_dialog)
+        file_menu.add_command(label="Editar lista (JSON)...", command=self.edit_config)
+        file_menu.add_command(label="Recargar lista", command=self.reload)
+        file_menu.add_separator()
+        file_menu.add_command(label="Salir", command=self.root.quit)
+        menubar.add_cascade(label="Archivo", menu=file_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Buscar actualizaciones ahora", command=self.check_updates_dialog)
+        self.auto_update_var = tk.BooleanVar(value=self.settings.get("auto_check_updates", True))
+        help_menu.add_checkbutton(
+            label="Buscar actualizaciones automáticamente",
+            variable=self.auto_update_var,
+            command=self._toggle_auto_updates,
+        )
+        help_menu.add_separator()
+        help_menu.add_command(label="Acerca de...", command=self.show_about)
+        menubar.add_cascade(label="Ayuda", menu=help_menu)
+
+        self.root.config(menu=menubar)
+
+    def _build_update_icon(self, parent: tk.Widget) -> None:
+        wrapper = tk.Frame(parent, bg=COLORS["bg"])
+        wrapper.pack(side="right")
+
+        self.update_icon = tk.Label(
+            wrapper,
+            text="🔄",
+            font=("Segoe UI Emoji", 14),
+            fg=COLORS["text_muted"],
+            bg=COLORS["bg"],
+            cursor="hand2",
+        )
+        self.update_icon.pack()
+        self.update_icon.bind("<Button-1>", lambda _event: self.check_updates_dialog())
+        self._add_tooltip(self.update_icon, "Buscar actualizaciones")
+
+        # Punto rojo que avisa de que hay una actualización pendiente.
+        self.update_badge = tk.Canvas(
+            wrapper, width=8, height=8, bg=COLORS["bg"], highlightthickness=0
+        )
+        self.update_badge.create_oval(0, 0, 8, 8, fill=COLORS["danger"], outline="")
+        # Oculto por defecto; se muestra con _set_update_available().
+
+    def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
+        state = {"win": None}
+
+        def show(_event) -> None:
+            win = tk.Toplevel(widget)
+            win.overrideredirect(True)
+            win.configure(bg=COLORS["surface"])
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            win.geometry(f"+{x}+{y}")
+            tk.Label(
+                win,
+                text=text,
+                font=("Segoe UI", 8),
+                fg=COLORS["text"],
+                bg=COLORS["surface"],
+                padx=6,
+                pady=3,
+            ).pack()
+            state["win"] = win
+
+        def hide(_event) -> None:
+            if state["win"] is not None:
+                state["win"].destroy()
+                state["win"] = None
+
+        widget.bind("<Enter>", show, add="+")
+        widget.bind("<Leave>", hide, add="+")
+
     def _on_mousewheel(self, event) -> None:
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    # ------------------------------------------------------------------
+    # Accesos directos
+    # ------------------------------------------------------------------
 
     def refresh_buttons(self) -> None:
         for child in self.scrollable.winfo_children():
@@ -233,7 +324,7 @@ class AccesosDirectosApp:
         if not self.shortcuts:
             tk.Label(
                 self.scrollable,
-                text="No hay accesos configurados.\nPulsa «+ Añadir» para empezar.",
+                text="No hay accesos configurados.\nUsa «Archivo → Añadir acceso» para empezar.",
                 font=("Segoe UI", 11),
                 fg=COLORS["text_muted"],
                 bg=COLORS["bg"],
@@ -373,123 +464,82 @@ class AccesosDirectosApp:
             messagebox.showerror("Error", f"No se pudo abrir la configuración:\n{exc}")
 
     def reload(self) -> None:
+        # Vuelve a leer shortcuts.json desde el disco. Útil solo si has
+        # editado ese archivo a mano desde «Editar lista (JSON)».
         self.shortcuts = load_shortcuts()
         self.refresh_buttons()
 
-    def open_settings_dialog(self) -> None:
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Configuración")
-        dialog.configure(bg=COLORS["bg"])
-        dialog.geometry("520x360")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        github = self.settings.get("github", {})
-
-        tk.Label(
-            dialog,
-            text="Repositorio de GitHub para actualizaciones",
-            font=("Segoe UI", 11, "bold"),
-            fg=COLORS["text"],
-            bg=COLORS["bg"],
-        ).pack(anchor="w", padx=16, pady=(16, 8))
-
-        tk.Label(
-            dialog,
-            text="Funciona con repos privados si indicas un token con permiso «repo».",
-            font=("Segoe UI", 9),
-            fg=COLORS["text_muted"],
-            bg=COLORS["bg"],
-            wraplength=480,
-            justify="left",
-        ).pack(anchor="w", padx=16, pady=(0, 12))
-
-        form = tk.Frame(dialog, bg=COLORS["bg"], padx=16)
-        form.pack(fill="x")
-
-        owner_entry = ttk.Entry(form, width=48)
-        repo_entry = ttk.Entry(form, width=48)
-        token_entry = ttk.Entry(form, width=48, show="*")
-        startup_var = tk.BooleanVar(value=self.settings.get("check_updates_on_startup", True))
-
-        labels = ("Propietario (usuario u organización):", "Repositorio:", "Token de GitHub (opcional):")
-        entries = (owner_entry, repo_entry, token_entry)
-        for row, (label, entry) in enumerate(zip(labels, entries)):
-            tk.Label(form, text=label, fg=COLORS["text"], bg=COLORS["bg"]).grid(
-                row=row, column=0, sticky="w", pady=(0, 4)
-            )
-            entry.grid(row=row + 1, column=0, sticky="ew", pady=(0, 10))
-
-        owner_entry.insert(0, github.get("owner", ""))
-        repo_entry.insert(0, github.get("repo", "accesos-directos"))
-        token_entry.insert(0, github.get("token", ""))
-
-        ttk.Checkbutton(
-            dialog,
-            text="Buscar actualizaciones al iniciar",
-            variable=startup_var,
-        ).pack(anchor="w", padx=16, pady=(8, 0))
-
-        def save_and_close() -> None:
-            self.settings["github"] = {
-                "owner": owner_entry.get().strip(),
-                "repo": repo_entry.get().strip() or "accesos-directos",
-                "token": token_entry.get().strip(),
-            }
-            self.settings["check_updates_on_startup"] = startup_var.get()
-            save_settings(self.settings)
-            dialog.destroy()
-            messagebox.showinfo("Configuración guardada", "Los ajustes se han guardado correctamente.")
-
-        buttons = tk.Frame(dialog, bg=COLORS["bg"], padx=16, pady=16)
-        buttons.pack(fill="x", side="bottom")
-        ttk.Button(buttons, text="Guardar", command=save_and_close).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="left")
-
-    def _github_settings(self) -> tuple[str, str, str]:
-        github = self.settings.get("github", {})
-        return (
-            github.get("owner", ""),
-            github.get("repo", "accesos-directos"),
-            github.get("token", ""),
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            "Acerca de",
+            f"Accesos Directos\nVersión {get_app_version()}\n\n"
+            f"Actualizaciones desde: github.com/{GITHUB_OWNER}/{GITHUB_REPO}",
         )
 
+    # ------------------------------------------------------------------
+    # Actualizaciones
+    # ------------------------------------------------------------------
+
+    def _toggle_auto_updates(self) -> None:
+        self.settings["auto_check_updates"] = self.auto_update_var.get()
+        save_settings(self.settings)
+
+    def _set_update_icon_checking(self, checking: bool) -> None:
+        if checking:
+            self.update_icon.configure(fg=COLORS["accent"])
+        else:
+            color = COLORS["accent"] if self._pending_update else COLORS["text_muted"]
+            self.update_icon.configure(fg=color)
+
+    def _set_update_available(self, update) -> None:
+        self._pending_update = update
+        self.update_icon.configure(fg=COLORS["accent"])
+        self.update_badge.place(in_=self.update_icon, relx=1.0, rely=0.0, anchor="ne", x=2, y=-2)
+
+    def _clear_update_badge(self) -> None:
+        self._pending_update = None
+        self.update_icon.configure(fg=COLORS["text_muted"])
+        self.update_badge.place_forget()
+
     def _maybe_check_updates_on_startup(self) -> None:
-        if not self.settings.get("check_updates_on_startup", True):
+        if not self.auto_update_var.get():
             return
-        owner, repo, _token = self._github_settings()
-        if not owner or not repo:
-            return
-        self._run_update_check(silent_if_updated=True)
+        self._run_update_check(silent_if_updated=True, show_toast=True)
+
+    def _auto_check_loop(self) -> None:
+        if self.auto_update_var.get():
+            self._run_update_check(silent_if_updated=True, show_toast=True)
+        self.root.after(UPDATE_CHECK_INTERVAL_MS, self._auto_check_loop)
 
     def check_updates_dialog(self) -> None:
-        owner, repo, _token = self._github_settings()
-        if not owner or not repo:
-            messagebox.showinfo(
-                "Configuración necesaria",
-                "Indica el repositorio de GitHub en Configuración antes de buscar actualizaciones.",
-            )
-            self.open_settings_dialog()
+        # Si ya sabíamos de una actualización pendiente, no hace falta
+        # volver a preguntar a GitHub: se ofrece instalar directamente.
+        if self._pending_update is not None:
+            self._prompt_install(self._pending_update)
             return
-        self._run_update_check(silent_if_updated=False)
+        self._run_update_check(silent_if_updated=False, show_toast=False)
 
-    def _run_update_check(self, silent_if_updated: bool) -> None:
+    def _run_update_check(self, silent_if_updated: bool, show_toast: bool) -> None:
         if self._update_running:
             return
 
         self._update_running = True
-        owner, repo, token = self._github_settings()
+        self.root.after(0, lambda: self._set_update_icon_checking(True))
 
         def worker() -> None:
             try:
-                update = check_for_updates(owner, repo, token)
+                update = check_for_updates()
             except UpdateError as exc:
-                self.root.after(0, lambda: messagebox.showerror("Actualizaciones", str(exc)))
-                return
-            finally:
                 self._update_running = False
+                self.root.after(0, lambda: self._set_update_icon_checking(False))
+                if not silent_if_updated:
+                    self.root.after(0, lambda: messagebox.showerror("Actualizaciones", str(exc)))
+                return
+
+            self._update_running = False
 
             if update is None:
+                self.root.after(0, self._clear_update_badge)
                 if not silent_if_updated:
                     self.root.after(
                         0,
@@ -500,20 +550,79 @@ class AccesosDirectosApp:
                     )
                 return
 
-            def prompt_install() -> None:
-                install = messagebox.askyesno(
-                    "Actualización disponible",
-                    f"Hay una nueva versión: {update.latest_version}\n"
-                    f"Versión actual: {update.current_version}\n\n"
-                    "¿Quieres descargar e instalar la actualización?\n\n"
-                    "Tus accesos directos no se modificarán.",
-                )
-                if install:
-                    self._install_update(update, token)
+            def on_found() -> None:
+                self._set_update_available(update)
+                if show_toast:
+                    self._show_update_toast(update)
+                else:
+                    self._prompt_install(update)
 
-            self.root.after(0, prompt_install)
+            self.root.after(0, on_found)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update_toast(self, update) -> None:
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.configure(bg=COLORS["surface"])
+        try:
+            toast.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        self.root.update_idletasks()
+        width, height = 300, 96
+        x = self.root.winfo_rootx() + self.root.winfo_width() - width - 20
+        y = self.root.winfo_rooty() + self.root.winfo_height() - height - 20
+        toast.geometry(f"{width}x{height}+{x}+{y}")
+
+        tk.Label(
+            toast,
+            text="🔄  Actualización disponible",
+            font=("Segoe UI", 10, "bold"),
+            fg=COLORS["accent"],
+            bg=COLORS["surface"],
+        ).pack(anchor="w", padx=14, pady=(12, 2))
+
+        tk.Label(
+            toast,
+            text=f"Versión {update.latest_version} (tienes la {update.current_version})",
+            font=("Segoe UI", 9),
+            fg=COLORS["text"],
+            bg=COLORS["surface"],
+        ).pack(anchor="w", padx=14)
+
+        buttons = tk.Frame(toast, bg=COLORS["surface"])
+        buttons.pack(anchor="e", padx=10, pady=(10, 10))
+
+        def install_now() -> None:
+            toast.destroy()
+            self._install_update(update, GITHUB_TOKEN)
+
+        def dismiss() -> None:
+            toast.destroy()
+
+        ttk.Button(buttons, text="Actualizar", command=install_now).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Más tarde", command=dismiss).pack(side="left")
+
+        def auto_close() -> None:
+            try:
+                toast.destroy()
+            except tk.TclError:
+                pass
+
+        toast.after(10000, auto_close)
+
+    def _prompt_install(self, update) -> None:
+        install = messagebox.askyesno(
+            "Actualización disponible",
+            f"Hay una nueva versión: {update.latest_version}\n"
+            f"Versión actual: {update.current_version}\n\n"
+            "¿Quieres descargar e instalar la actualización?\n\n"
+            "Tus accesos directos no se modificarán.",
+        )
+        if install:
+            self._install_update(update, GITHUB_TOKEN)
 
     def _install_update(self, update, token: str) -> None:
         progress = tk.Toplevel(self.root)
@@ -539,6 +648,7 @@ class AccesosDirectosApp:
 
             def done() -> None:
                 progress.destroy()
+                self._clear_update_badge()
                 restart = messagebox.askyesno(
                     "Actualización instalada",
                     "La aplicación se ha actualizado correctamente.\n"

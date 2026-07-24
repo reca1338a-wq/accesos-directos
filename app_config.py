@@ -23,6 +23,13 @@ APP_DIR = _get_app_dir()
 VERSION_FILE = APP_DIR / "VERSION"
 LEGACY_SHORTCUTS_PATH = APP_DIR / "shortcuts.json"
 
+# Repositorio de GitHub usado para comprobar actualizaciones.
+# Se configura aquí, en el código: el usuario final no puede cambiarlo
+# desde la aplicación.
+GITHUB_OWNER = "reca1338a-wq"
+GITHUB_REPO = "accesos-directos"
+GITHUB_TOKEN = ""  # Déjalo vacío si el repositorio es público.
+
 if sys.platform == "win32":
     USER_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "AccesosDirectos"
 else:
@@ -32,12 +39,7 @@ SHORTCUTS_PATH = USER_DATA_DIR / "shortcuts.json"
 SETTINGS_PATH = USER_DATA_DIR / "settings.json"
 
 DEFAULT_SETTINGS = {
-    "github": {
-        "owner": "",
-        "repo": "accesos-directos",
-        "token": "",
-    },
-    "check_updates_on_startup": True,
+    "auto_check_updates": True,
 }
 
 DEFAULT_SHORTCUTS = [
@@ -77,9 +79,8 @@ def load_settings() -> dict:
         data = json.load(handle)
 
     merged = json.loads(json.dumps(DEFAULT_SETTINGS))
-    merged["github"].update(data.get("github", {}))
-    merged["check_updates_on_startup"] = data.get(
-        "check_updates_on_startup", DEFAULT_SETTINGS["check_updates_on_startup"]
+    merged["auto_check_updates"] = data.get(
+        "auto_check_updates", DEFAULT_SETTINGS["auto_check_updates"]
     )
     return merged
 

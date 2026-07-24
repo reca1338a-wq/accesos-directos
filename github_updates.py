@@ -15,7 +15,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from app_config import APP_DIR, VERSION_FILE, get_app_version
+from app_config import APP_DIR, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, VERSION_FILE, get_app_version
 
 UPDATE_FILES = ("main.py", "iniciar.bat", "VERSION", "app_config.py", "github_updates.py")
 
@@ -68,11 +68,12 @@ def _github_request(url: str, token: str = "") -> dict:
         raise UpdateError(f"No se pudo conectar con GitHub: {exc.reason}") from exc
 
 
-def check_for_updates(owner: str, repo: str, token: str = "") -> UpdateInfo | None:
-    owner = owner.strip()
-    repo = repo.strip()
+def check_for_updates(owner: str = "", repo: str = "", token: str = "") -> UpdateInfo | None:
+    owner = (owner or GITHUB_OWNER).strip()
+    repo = (repo or GITHUB_REPO).strip()
+    token = token or GITHUB_TOKEN
     if not owner or not repo:
-        raise UpdateError("Configura el propietario y nombre del repositorio en Configuración.")
+        raise UpdateError("Configura GITHUB_OWNER y GITHUB_REPO en app_config.py.")
 
     current = get_app_version()
     release = _github_request(f"https://api.github.com/repos/{owner}/{repo}/releases/latest", token)
