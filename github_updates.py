@@ -163,14 +163,26 @@ def restart_with_update() -> None:
 
     # En Windows no se puede sobrescribir un .exe mientras se está ejecutando,
     # así que dejamos un script que espera a que cerremos, hace el cambio y
-    # vuelve a abrir la app.
+    # vuelve a abrir la app. Reintenta el borrado hasta que el archivo viejo
+    # quede realmente libre (el proceso anterior o el antivirus pueden
+    # tardar un instante en soltarlo), y da un respiro tras copiar el nuevo
+    # antes de lanzarlo, para evitar el error "Failed to load Python DLL".
     updater = current_exe.with_name("_actualizar.bat")
     updater.write_text(
         "@echo off\n"
+        "setlocal\n"
+        f'set "CURRENT={current_exe}"\n'
+        f'set "NEW={new_exe}"\n'
         "timeout /t 2 /nobreak >nul\n"
-        f'del "{current_exe}"\n'
-        f'move /y "{new_exe}" "{current_exe}"\n'
-        f'start "" "{current_exe}"\n'
+        ":esperar_liberacion\n"
+        'del "%CURRENT%" 2>nul\n'
+        'if exist "%CURRENT%" (\n'
+        "  timeout /t 1 /nobreak >nul\n"
+        "  goto esperar_liberacion\n"
+        ")\n"
+        'move /y "%NEW%" "%CURRENT%" >nul\n'
+        "timeout /t 1 /nobreak >nul\n"
+        'start "" "%CURRENT%"\n'
         'del "%~f0"\n',
         encoding="utf-8",
     )
