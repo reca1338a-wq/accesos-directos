@@ -1,12 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+# tkinterdnd2 necesita sus archivos Tcl empaquetados aparte (no son código
+# Python), o el arrastrar-y-soltar desde el Explorador no funcionará en el
+# .exe aunque funcione al ejecutar desde el código fuente.
+datas = [('VERSION', '.')]
+try:
+    datas += collect_data_files('tkinterdnd2')
+except Exception:
+    pass
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('VERSION', '.')],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=['win32gui', 'win32ui', 'win32con', 'win32api', 'PIL._tkinter_finder'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

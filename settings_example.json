@@ -1,0 +1,8 @@
+{
+  "github": {
+    "owner": "TU_USUARIO_GITHUB",
+    "repo": "accesos-directos",
+    "token": ""
+  },
+  "check_updates_on_startup": true
+}

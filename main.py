@@ -10,6 +10,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
+import win_icons
 from app_config import (
     DEFAULT_SIZE,
     GITHUB_OWNER,
@@ -37,6 +38,23 @@ from github_updates import (
     restart_app,
     restart_with_update,
 )
+
+# Arrastrar archivos desde el Explorador de Windows requiere tkinterdnd2.
+# Si no está instalado, la app sigue funcionando con normalidad, solo sin
+# esa función (se instala automáticamente con requirements.txt / iniciar.bat).
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
+# Tamaño en píxeles del icono real de Windows según el tamaño de tarjeta.
+ICON_PIXEL_SIZES = {"small": 28, "medium": 32, "large": 40}
+
+# Teclas que no deben redirigir el foco al buscador aunque produzcan un
+# carácter "imprimible" (o vacío) al pulsarlas.
+_SEARCH_IGNORED_KEYSYMS = {"Tab", "Return", "Escape", "BackSpace", "Delete"}
 
 # Cada cuánto se comprueba si hay una versión nueva en segundo plano.
 UPDATE_CHECK_INTERVAL_MS = 15 * 60 * 1000
@@ -103,10 +121,20 @@ class Tile(tk.Frame):
         self._press_ctrl = False
         self._press_shift = False
 
-        icon = "📁" if item["type"] == "folder" else "📄"
-        tk.Label(
-            self, text=icon, font=("Segoe UI Emoji", 18), fg=text_color, bg=bg
-        ).pack(pady=(14, 2))
+        self._icon_photo = None  # referencia viva: evita que Tk la recolecte
+        icon_photo = None
+        if item["type"] == "shortcut":
+            icon_size = ICON_PIXEL_SIZES.get(item.get("size", DEFAULT_SIZE), 32)
+            icon_photo = win_icons.get_icon_photo(item.get("path", ""), icon_size)
+
+        if icon_photo is not None:
+            self._icon_photo = icon_photo
+            tk.Label(self, image=icon_photo, bg=bg).pack(pady=(14, 2))
+        else:
+            icon = "📁" if item["type"] == "folder" else "📄"
+            tk.Label(
+                self, text=icon, font=("Segoe UI Emoji", 18), fg=text_color, bg=bg
+            ).pack(pady=(14, 2))
 
         tk.Label(
             self,
@@ -163,7 +191,7 @@ class Tile(tk.Frame):
     # -- interacción -----------------------------------------------------
 
     def _on_press(self, event: tk.Event) -> None:
-        self._press_pos = (event.x_root, event.y_root)
+        self._press_pos = None if self.app._is_searching() else (event.x_root, event.y_root)
         self._dragging = False
         self._press_ctrl = bool(event.state & 0x0004)
         self._press_shift = bool(event.state & 0x0001)
@@ -232,7 +260,7 @@ class AccesosDirectosApp:
         self._last_click_time = 0.0
         self._last_click_id: str | None = None
 
-        self.root = tk.Tk()
+        self.root = TkinterDnD.Tk() if _DND_AVAILABLE else tk.Tk()
         self.root.title("Accesos Directos")
         self.root.geometry("760x560")
         self.root.minsize(420, 320)
@@ -241,6 +269,8 @@ class AccesosDirectosApp:
         self._build_ui()
         self.root.update_idletasks()
         self._layout_tiles()
+
+        self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
 
         self.root.after(1500, self._maybe_check_updates_on_startup)
         self.root.after(UPDATE_CHECK_INTERVAL_MS, self._auto_check_loop)
@@ -302,15 +332,22 @@ class AccesosDirectosApp:
             toolbar, text="+  Añadir", style="Accent.TButton", command=self.open_add_dialog
         ).pack(side="left")
 
+        self._build_search_box(toolbar)
+
+        hint_text = (
+            "Arrastra sobre una carpeta o sobre la ruta de arriba para mover. "
+            "Clic para seleccionar, Mayús + clic para un rango, Ctrl + clic para añadir/quitar uno."
+        )
+        if _DND_AVAILABLE:
+            hint_text += " Arrastra un archivo desde el Explorador para crear su acceso."
         tk.Label(
             toolbar,
-            text=(
-                "Arrastra sobre una carpeta o sobre la ruta de arriba para mover. "
-                "Ctrl/Mayús + clic para seleccionar varios."
-            ),
+            text=hint_text,
             font=("Segoe UI", 8),
             fg=colors["text_muted"],
             bg=colors["bg"],
+            wraplength=380,
+            justify="left",
         ).pack(side="left", padx=(14, 0))
 
         canvas_frame = tk.Frame(self.root, bg=colors["bg"], padx=20, pady=8)
@@ -328,7 +365,14 @@ class AccesosDirectosApp:
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-1>", self._on_background_click, add="+")
         self.scrollable.bind("<Button-1>", self._on_background_click, add="+")
-        self.root.bind("<Escape>", lambda _e: self._clear_selection())
+        self.root.bind("<Escape>", lambda _e: self._on_escape())
+
+        if _DND_AVAILABLE:
+            for target in (self.canvas, self.scrollable):
+                target.drop_target_register(DND_FILES)
+                target.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+                target.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+                target.dnd_bind("<<Drop>>", self._on_files_dropped)
 
         footer = tk.Frame(self.root, bg=colors["bg"], padx=20)
         footer.pack(fill="x", pady=(0, 12))
@@ -395,6 +439,41 @@ class AccesosDirectosApp:
         )
         self.update_badge.create_oval(0, 0, 8, 8, fill=colors["danger"], outline="")
 
+    def _build_search_box(self, parent: tk.Widget) -> None:
+        colors = self.colors
+        wrap = tk.Frame(parent, bg=colors["surface"])
+        wrap.pack(side="right")
+
+        tk.Label(
+            wrap, text="🔍", font=("Segoe UI", 10), fg=colors["text_muted"], bg=colors["surface"],
+        ).pack(side="left", padx=(10, 2))
+
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(
+            wrap,
+            textvariable=self.search_var,
+            font=("Segoe UI", 10),
+            fg=colors["text"],
+            bg=colors["surface"],
+            insertbackground=colors["text"],
+            relief="flat",
+            width=22,
+            highlightthickness=0,
+        )
+        self.search_entry.pack(side="left", ipady=5)
+        self.search_var.trace_add("write", lambda *_a: self._on_search_changed())
+
+        self.search_clear_btn = tk.Label(
+            wrap, text="✕", font=("Segoe UI", 9), fg=colors["text_muted"], bg=colors["surface"],
+            cursor="hand2",
+        )
+        self.search_clear_btn.pack(side="left", padx=(4, 10))
+        self.search_clear_btn.bind("<Button-1>", lambda _e: self._clear_search())
+
+        self._add_tooltip(
+            self.search_entry, "Buscar accesos directos (o simplemente empieza a escribir)"
+        )
+
     def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
         colors = self.colors
         state = {"win": None}
@@ -430,6 +509,99 @@ class AccesosDirectosApp:
         return path
 
     # ------------------------------------------------------------------
+    # Búsqueda
+    # ------------------------------------------------------------------
+
+    def _on_search_changed(self) -> None:
+        self._render_breadcrumb()
+        self._layout_tiles()
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        self.root.focus_set()
+
+    def _on_escape(self) -> None:
+        if self.search_var.get():
+            self._clear_search()
+            return
+        self._clear_selection()
+
+    def _on_global_keypress(self, event: tk.Event) -> None:
+        # Si hay un diálogo abierto (renombrar, crear carpeta/acceso,
+        # ajustes, elegir color...) no interceptamos nada: que la persona
+        # pueda escribir con normalidad en ese diálogo.
+        widget = event.widget
+        try:
+            toplevel = widget.winfo_toplevel()
+        except Exception:
+            toplevel = None
+        if toplevel is not None and toplevel is not self.root:
+            return
+
+        # Si ya se está escribiendo en un campo de texto (incluido el
+        # propio buscador), dejamos que Tk lo gestione de forma normal.
+        focus = self.root.focus_get()
+        if isinstance(focus, (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox)):
+            return
+
+        char = event.char
+        if not char or not char.isprintable():
+            return  # Teclas como Ctrl, Alt, Mayús o flechas no producen esto.
+        if event.keysym in _SEARCH_IGNORED_KEYSYMS:
+            return
+
+        self.search_entry.focus_set()
+        self.search_var.set(self.search_var.get() + char)
+        self.search_entry.icursor("end")
+
+    # ------------------------------------------------------------------
+    # Arrastrar archivos desde el Explorador de Windows
+    # ------------------------------------------------------------------
+
+    def _on_drop_enter(self, _event) -> None:
+        self.canvas.configure(highlightthickness=2, highlightbackground=self.colors["accent"])
+
+    def _on_drop_leave(self, _event) -> None:
+        self.canvas.configure(highlightthickness=0)
+
+    def _on_files_dropped(self, event) -> None:
+        self._on_drop_leave(event)
+        if self._is_searching():
+            self.search_var.set("")
+
+        try:
+            paths = self.root.tk.splitlist(event.data)
+        except Exception:
+            paths = [event.data]
+
+        siblings = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
+        next_order = len(siblings)
+        added = 0
+
+        for raw_path in paths:
+            candidate = Path(raw_path)
+            if not candidate.exists():
+                continue
+            self.shortcuts.append(
+                {
+                    "id": new_item_id(),
+                    "type": "shortcut",
+                    "name": candidate.name or str(candidate),
+                    "path": str(candidate),
+                    "parent_id": self.current_folder_id,
+                    "order": next_order,
+                    "color": None,
+                    "size": DEFAULT_SIZE,
+                }
+            )
+            next_order += 1
+            added += 1
+
+        if added:
+            save_shortcuts(self.shortcuts)
+            self._layout_tiles()
+
+    # ------------------------------------------------------------------
     # Navegación de carpetas
     # ------------------------------------------------------------------
 
@@ -438,6 +610,17 @@ class AccesosDirectosApp:
         for child in self.breadcrumb_frame.winfo_children():
             child.destroy()
         self._breadcrumb_targets = []
+
+        query = self.search_var.get().strip() if hasattr(self, "search_var") else ""
+        if query:
+            tk.Label(
+                self.breadcrumb_frame,
+                text=f"🔍  Resultados para «{query}»",
+                font=("Segoe UI", 9, "bold"),
+                fg=colors["accent"],
+                bg=colors["bg"],
+            ).pack(side="left")
+            return
 
         for index, (name, folder_id) in enumerate(self.breadcrumb):
             is_last = index == len(self.breadcrumb) - 1
@@ -467,7 +650,28 @@ class AccesosDirectosApp:
         self._layout_tiles()
 
     def navigate_into(self, folder_item: dict) -> None:
+        self.search_var.set("")
         self.breadcrumb.append((folder_item["name"], folder_item["id"]))
+        self.current_folder_id = folder_item["id"]
+        self.selected_ids.clear()
+        self._selection_anchor_id = None
+        self._render_breadcrumb()
+        self._layout_tiles()
+
+    def _jump_to_folder(self, folder_item: dict) -> None:
+        """Navega directamente a una carpeta encontrada por búsqueda,
+        reconstruyendo la ruta completa de migas de pan hasta ella."""
+        chain = [folder_item]
+        parent_id = folder_item["parent_id"]
+        while parent_id is not None:
+            parent = next((it for it in self.shortcuts if it["id"] == parent_id), None)
+            if parent is None:
+                break
+            chain.append(parent)
+            parent_id = parent["parent_id"]
+        chain.reverse()
+
+        self.breadcrumb = [("Inicio", None)] + [(it["name"], it["id"]) for it in chain]
         self.current_folder_id = folder_item["id"]
         self.selected_ids.clear()
         self._selection_anchor_id = None
@@ -496,9 +700,18 @@ class AccesosDirectosApp:
             self._clear_selection()
 
     def _visible_items(self) -> list[dict]:
+        query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
+        if query:
+            matches = [it for it in self.shortcuts if query in it["name"].lower()]
+            matches.sort(key=lambda it: it["name"].lower())
+            return matches
+
         items = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
         items.sort(key=lambda it: it.get("order", 0))
         return items
+
+    def _is_searching(self) -> bool:
+        return bool(self.search_var.get().strip()) if hasattr(self, "search_var") else False
 
     def _layout_tiles(self) -> None:
         self._resize_after_id = None
@@ -510,9 +723,14 @@ class AccesosDirectosApp:
 
         if not items:
             self._tile_by_id = {}
+            empty_text = (
+                "No se encontraron accesos directos."
+                if self._is_searching()
+                else "Esta carpeta está vacía.\nUsa «+ Añadir» para empezar."
+            )
             tk.Label(
                 self.scrollable,
-                text="Esta carpeta está vacía.\nUsa «+ Añadir» para empezar.",
+                text=empty_text,
                 font=("Segoe UI", 11),
                 fg=self.colors["text_muted"],
                 bg=self.colors["bg"],
@@ -582,10 +800,10 @@ class AccesosDirectosApp:
     # ------------------------------------------------------------------
 
     def handle_tile_click(self, tile: Tile) -> None:
-        if self.selected_ids:
-            self.selected_ids.clear()
-            self._selection_anchor_id = None
-            self._layout_tiles()
+        item_id = tile.item["id"]
+        self.selected_ids = {item_id}
+        self._selection_anchor_id = item_id
+        self._layout_tiles()
 
         mode = self.settings.get("click_mode", "double")
         if mode == "single":
@@ -593,17 +811,20 @@ class AccesosDirectosApp:
             return
 
         now = time.monotonic() * 1000
-        if self._last_click_id == tile.item["id"] and now - self._last_click_time <= DOUBLE_CLICK_MS:
+        if self._last_click_id == item_id and now - self._last_click_time <= DOUBLE_CLICK_MS:
             self._last_click_time = 0
             self._last_click_id = None
             self.open_item(tile.item)
         else:
             self._last_click_time = now
-            self._last_click_id = tile.item["id"]
+            self._last_click_id = item_id
 
     def open_item(self, item: dict) -> None:
         if item["type"] == "folder":
-            self.navigate_into(item)
+            if self._is_searching():
+                self._jump_to_folder(item)
+            else:
+                self.navigate_into(item)
             return
         try:
             open_path(item["path"])
@@ -613,6 +834,8 @@ class AccesosDirectosApp:
             messagebox.showerror("Error al abrir", str(exc))
 
     def begin_drag(self, tile: Tile) -> None:
+        if self._is_searching():
+            return
         self._drag_source = tile
         if tile.item["id"] in self.selected_ids and len(self.selected_ids) > 1:
             self._drag_sources = [
@@ -1201,6 +1424,7 @@ class AccesosDirectosApp:
 
     def reload(self) -> None:
         self.shortcuts = load_shortcuts()
+        win_icons.clear_cache()
         self._layout_tiles()
 
     def show_about(self) -> None:

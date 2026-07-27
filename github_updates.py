@@ -17,7 +17,15 @@ from pathlib import Path
 
 from app_config import APP_DIR, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, VERSION_FILE, get_app_version
 
-UPDATE_FILES = ("main.py", "iniciar.bat", "VERSION", "app_config.py", "github_updates.py")
+UPDATE_FILES = (
+    "main.py",
+    "iniciar.bat",
+    "VERSION",
+    "app_config.py",
+    "github_updates.py",
+    "win_icons.py",
+    "requirements.txt",
+)
 
 
 @dataclass
