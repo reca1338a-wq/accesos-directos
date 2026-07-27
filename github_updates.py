@@ -109,6 +109,30 @@ def check_for_updates(owner: str = "", repo: str = "", token: str = "") -> Updat
     )
 
 
+def cleanup_stale_update_files() -> None:
+    """Borra restos de una actualización anterior (por si algo quedó a medias).
+
+    Se llama al arrancar la app: si estamos corriendo como el .exe actual,
+    cualquier *_nuevo.exe o _actualizar.bat que siga junto a él es basura
+    de una actualización ya aplicada (o interrumpida) y se puede eliminar
+    con seguridad.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+
+    current_exe = Path(sys.executable).resolve()
+    candidates = (
+        current_exe.with_name(current_exe.stem + "_nuevo.exe"),
+        current_exe.with_name("_actualizar.bat"),
+    )
+    for stale in candidates:
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+
 def apply_update(download_url: str, token: str = "", latest_version: str = "") -> None:
     """Descarga e instala la actualización. Se adapta según si es .exe o .py sueltos."""
     if getattr(sys, "frozen", False):
@@ -163,10 +187,15 @@ def restart_with_update() -> None:
 
     # En Windows no se puede sobrescribir un .exe mientras se está ejecutando,
     # así que dejamos un script que espera a que cerremos, hace el cambio y
-    # vuelve a abrir la app. Reintenta el borrado hasta que el archivo viejo
-    # quede realmente libre (el proceso anterior o el antivirus pueden
-    # tardar un instante en soltarlo), y da un respiro tras copiar el nuevo
-    # antes de lanzarlo, para evitar el error "Failed to load Python DLL".
+    # vuelve a abrir la app.
+    #
+    # Reintenta el borrado y el movido en bucle en vez de esperar un tiempo
+    # fijo: el proceso anterior o el antivirus (que escanea el .exe recién
+    # descargado) pueden tardar un instante variable en soltar el archivo.
+    # Confirmar cada paso antes de continuar evita el error
+    # "Failed to load Python DLL" al abrir el ejecutable a medio mover, y
+    # el "if exist %NEW% del" final evita que quede un *_nuevo.exe huérfano
+    # si algo se retrasa más de lo normal.
     updater = current_exe.with_name("_actualizar.bat")
     updater.write_text(
         "@echo off\n"
@@ -180,7 +209,13 @@ def restart_with_update() -> None:
         "  timeout /t 1 /nobreak >nul\n"
         "  goto esperar_liberacion\n"
         ")\n"
-        'move /y "%NEW%" "%CURRENT%" >nul\n'
+        ":mover\n"
+        'move /y "%NEW%" "%CURRENT%" >nul 2>nul\n'
+        'if not exist "%CURRENT%" (\n'
+        "  timeout /t 1 /nobreak >nul\n"
+        "  goto mover\n"
+        ")\n"
+        'if exist "%NEW%" del /f /q "%NEW%"\n'
         "timeout /t 1 /nobreak >nul\n"
         'start "" "%CURRENT%"\n'
         'del "%~f0"\n',
