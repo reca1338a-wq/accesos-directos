@@ -89,13 +89,19 @@ class Tile(tk.Frame):
         text_color = _readable_text_color(custom_color) if custom_color else colors["text"]
         muted_color = text_color if custom_color else colors["text_muted"]
 
-        super().__init__(master, bg=bg, highlightthickness=2, highlightbackground=bg)
+        self.selected = item["id"] in app.selected_ids
+        border_color = colors["accent"] if self.selected else bg
+        border_thickness = 3 if self.selected else 2
+
+        super().__init__(master, bg=bg, highlightthickness=border_thickness, highlightbackground=border_color)
         self.app = app
         self.item = item
-        self.base_bg = bg
+        self.base_bg = border_color
         self.preset = preset
         self._press_pos: tuple[int, int] | None = None
         self._dragging = False
+        self._press_ctrl = False
+        self._press_shift = False
 
         icon = "📁" if item["type"] == "folder" else "📄"
         tk.Label(
@@ -146,19 +152,21 @@ class Tile(tk.Frame):
 
     def set_drop_highlight(self, on: bool) -> None:
         color = self.app.colors["accent"] if on else self.base_bg
-        self.configure(highlightbackground=color, highlightthickness=3 if on else 2)
+        self.configure(highlightbackground=color, highlightthickness=3 if (on or self.selected) else 2)
 
     def set_dragging(self, on: bool) -> None:
         # Marca claramente cuál tarjeta se está moviendo: borde grueso de
         # color de acento, para que no haya duda de cuál es.
         color = self.app.colors["accent"] if on else self.base_bg
-        self.configure(highlightbackground=color, highlightthickness=3 if on else 2)
+        self.configure(highlightbackground=color, highlightthickness=3 if (on or self.selected) else 2)
 
     # -- interacción -----------------------------------------------------
 
     def _on_press(self, event: tk.Event) -> None:
         self._press_pos = (event.x_root, event.y_root)
         self._dragging = False
+        self._press_ctrl = bool(event.state & 0x0004)
+        self._press_shift = bool(event.state & 0x0001)
 
     def _on_motion(self, event: tk.Event) -> None:
         if self._press_pos is None:
@@ -174,6 +182,10 @@ class Tile(tk.Frame):
     def _on_release(self, event: tk.Event) -> None:
         if self._dragging:
             self.app.end_drag(event.x_root, event.y_root)
+        elif self._press_ctrl:
+            self.app.toggle_tile_selection(self)
+        elif self._press_shift:
+            self.app.extend_tile_selection(self)
         else:
             self.app.handle_tile_click(self)
         self._press_pos = None
@@ -199,13 +211,22 @@ class AccesosDirectosApp:
         self.current_folder_id: str | None = None
         self.breadcrumb: list[tuple[str, str | None]] = [("Inicio", None)]
 
+        self.selected_ids: set[str] = set()
+        self._selection_anchor_id: str | None = None
+
         self._update_running = False
         self._pending_update = None
         self._resize_after_id: str | None = None
+        self._tile_by_id: dict[str, Tile] = {}
         self._drag_source: Tile | None = None
+        self._drag_sources: list[dict] = []
         self._drag_target: Tile | None = None
         self._drag_mode: str | None = None  # "into" o "insert"
         self._drag_side: str | None = None  # "before" o "after"
+        self._drag_target_kind: str | None = None  # "tile" o "breadcrumb"
+        self._drag_breadcrumb_folder_id: str | None = None
+        self._drag_breadcrumb_widget: tk.Label | None = None
+        self._breadcrumb_targets: list[tuple[tk.Label, str | None]] = []
         self._drag_ghost: tk.Toplevel | None = None
         self._drop_indicator: tk.Frame | None = None
         self._last_click_time = 0.0
@@ -283,7 +304,10 @@ class AccesosDirectosApp:
 
         tk.Label(
             toolbar,
-            text="Arrastra una tarjeta sobre una carpeta para moverla dentro",
+            text=(
+                "Arrastra sobre una carpeta o sobre la ruta de arriba para mover. "
+                "Ctrl/Mayús + clic para seleccionar varios."
+            ),
             font=("Segoe UI", 8),
             fg=colors["text_muted"],
             bg=colors["bg"],
@@ -302,6 +326,9 @@ class AccesosDirectosApp:
         scrollbar.pack(side="right", fill="y")
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-1>", self._on_background_click, add="+")
+        self.scrollable.bind("<Button-1>", self._on_background_click, add="+")
+        self.root.bind("<Escape>", lambda _e: self._clear_selection())
 
         footer = tk.Frame(self.root, bg=colors["bg"], padx=20)
         footer.pack(fill="x", pady=(0, 12))
@@ -410,6 +437,7 @@ class AccesosDirectosApp:
         colors = self.colors
         for child in self.breadcrumb_frame.winfo_children():
             child.destroy()
+        self._breadcrumb_targets = []
 
         for index, (name, folder_id) in enumerate(self.breadcrumb):
             is_last = index == len(self.breadcrumb) - 1
@@ -424,6 +452,7 @@ class AccesosDirectosApp:
             label.pack(side="left")
             if not is_last:
                 label.bind("<Button-1>", lambda _e, i=index: self._go_to_breadcrumb(i))
+                self._breadcrumb_targets.append((label, folder_id))
                 tk.Label(
                     self.breadcrumb_frame, text="  ›  ", font=("Segoe UI", 9),
                     fg=colors["text_muted"], bg=colors["bg"],
@@ -432,12 +461,16 @@ class AccesosDirectosApp:
     def _go_to_breadcrumb(self, index: int) -> None:
         self.breadcrumb = self.breadcrumb[: index + 1]
         self.current_folder_id = self.breadcrumb[-1][1]
+        self.selected_ids.clear()
+        self._selection_anchor_id = None
         self._render_breadcrumb()
         self._layout_tiles()
 
     def navigate_into(self, folder_item: dict) -> None:
         self.breadcrumb.append((folder_item["name"], folder_item["id"]))
         self.current_folder_id = folder_item["id"]
+        self.selected_ids.clear()
+        self._selection_anchor_id = None
         self._render_breadcrumb()
         self._layout_tiles()
 
@@ -451,6 +484,16 @@ class AccesosDirectosApp:
         # Pequeño margen de espera para no recalcular en cada píxel mientras
         # se arrastra el borde de la ventana: mantiene la app fluida.
         self._resize_after_id = self.root.after(80, self._layout_tiles)
+
+    def _on_background_click(self, event: tk.Event) -> None:
+        # Solo cuenta como "vacío" si el clic no cayó sobre una tarjeta
+        # (las tarjetas están colocadas encima con .place, pero un clic en
+        # el hueco entre ellas llega hasta el frame de fondo).
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if self._find_tile_ancestor(widget) is not None:
+            return
+        if self.selected_ids:
+            self._clear_selection()
 
     def _visible_items(self) -> list[dict]:
         items = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
@@ -466,6 +509,7 @@ class AccesosDirectosApp:
         canvas_width = max(self.canvas.winfo_width(), 240)
 
         if not items:
+            self._tile_by_id = {}
             tk.Label(
                 self.scrollable,
                 text="Esta carpeta está vacía.\nUsa «+ Añadir» para empezar.",
@@ -481,6 +525,7 @@ class AccesosDirectosApp:
         x = TILE_GAP
         y = TILE_GAP
         row_height = 0
+        self._tile_by_id = {}
         for item in items:
             preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
             width, height = preset["width"], preset["height"]
@@ -491,6 +536,7 @@ class AccesosDirectosApp:
 
             tile = Tile(self.scrollable, self, item)
             tile.place(x=x, y=y, width=width, height=height)
+            self._tile_by_id[item["id"]] = tile
 
             x += width + TILE_GAP
             row_height = max(row_height, height)
@@ -500,10 +546,47 @@ class AccesosDirectosApp:
         self.canvas.configure(scrollregion=(0, 0, canvas_width, total_height))
 
     # ------------------------------------------------------------------
+    # Selección de tarjetas (varias a la vez)
+    # ------------------------------------------------------------------
+
+    def toggle_tile_selection(self, tile: Tile) -> None:
+        item_id = tile.item["id"]
+        if item_id in self.selected_ids:
+            self.selected_ids.discard(item_id)
+        else:
+            self.selected_ids.add(item_id)
+        self._selection_anchor_id = item_id
+        self._layout_tiles()
+
+    def extend_tile_selection(self, tile: Tile) -> None:
+        ids_order = [it["id"] for it in self._visible_items()]
+        anchor_id = self._selection_anchor_id
+        if anchor_id not in ids_order:
+            anchor_id = tile.item["id"]
+        start = ids_order.index(anchor_id)
+        end = ids_order.index(tile.item["id"])
+        if start > end:
+            start, end = end, start
+        self.selected_ids = set(ids_order[start : end + 1])
+        self._layout_tiles()
+
+    def _clear_selection(self) -> None:
+        if not self.selected_ids and self._selection_anchor_id is None:
+            return
+        self.selected_ids.clear()
+        self._selection_anchor_id = None
+        self._layout_tiles()
+
+    # ------------------------------------------------------------------
     # Clic / doble clic (según preferencia) y arrastre
     # ------------------------------------------------------------------
 
     def handle_tile_click(self, tile: Tile) -> None:
+        if self.selected_ids:
+            self.selected_ids.clear()
+            self._selection_anchor_id = None
+            self._layout_tiles()
+
         mode = self.settings.get("click_mode", "double")
         if mode == "single":
             self.open_item(tile.item)
@@ -531,12 +614,24 @@ class AccesosDirectosApp:
 
     def begin_drag(self, tile: Tile) -> None:
         self._drag_source = tile
-        tile.configure(cursor="fleur")
-        tile.set_dragging(True)
-        self._create_drag_ghost(tile.item)
+        if tile.item["id"] in self.selected_ids and len(self.selected_ids) > 1:
+            self._drag_sources = [
+                it for it in self.shortcuts if it["id"] in self.selected_ids
+            ]
+        else:
+            self._drag_sources = [tile.item]
+
+        dragged_ids = {it["id"] for it in self._drag_sources}
+        for item_id in dragged_ids:
+            source_tile = self._tile_by_id.get(item_id)
+            if source_tile is not None:
+                source_tile.configure(cursor="fleur")
+                source_tile.set_dragging(True)
+
+        self._create_drag_ghost(self._drag_sources)
         self._drop_indicator = tk.Frame(self.scrollable, bg=self.colors["accent"])
 
-    def _create_drag_ghost(self, item: dict) -> None:
+    def _create_drag_ghost(self, items: list[dict]) -> None:
         colors = self.colors
         ghost = tk.Toplevel(self.root)
         ghost.overrideredirect(True)
@@ -545,10 +640,14 @@ class AccesosDirectosApp:
         except tk.TclError:
             pass
         ghost.configure(bg=colors["accent"])
-        icon = "📁" if item["type"] == "folder" else "📄"
+        if len(items) == 1:
+            icon = "📁" if items[0]["type"] == "folder" else "📄"
+            text = f"{icon}  {items[0]['name']}"
+        else:
+            text = f"🗃  {len(items)} elementos"
         tk.Label(
             ghost,
-            text=f"{icon}  {item['name']}",
+            text=text,
             font=("Segoe UI", 9, "bold"),
             fg=colors["bg"],
             bg=colors["accent"],
@@ -557,6 +656,21 @@ class AccesosDirectosApp:
         ).pack()
         self._drag_ghost = ghost
 
+    def _match_breadcrumb(self, widget) -> tuple[bool, str | None]:
+        for label, folder_id in self._breadcrumb_targets:
+            if widget is label:
+                return True, folder_id
+        return False, None
+
+    def _set_breadcrumb_highlight(self, widget: tk.Label | None) -> None:
+        if self._drag_breadcrumb_widget is not None and self._drag_breadcrumb_widget is not widget:
+            self._drag_breadcrumb_widget.configure(
+                fg=self.colors["text_muted"], font=("Segoe UI", 9, "normal")
+            )
+        if widget is not None:
+            widget.configure(fg=self.colors["accent"], font=("Segoe UI", 9, "bold"))
+        self._drag_breadcrumb_widget = widget
+
     def update_drag(self, x_root: int, y_root: int) -> None:
         # La tarjeta fantasma sigue al cursor con un pequeño desplazamiento
         # para no taparlo, dejando claro qué se está moviendo.
@@ -564,8 +678,27 @@ class AccesosDirectosApp:
             self._drag_ghost.geometry(f"+{x_root + 16}+{y_root + 12}")
 
         widget = self.root.winfo_containing(x_root, y_root)
+        dragged_ids = {it["id"] for it in self._drag_sources}
+
+        is_breadcrumb, breadcrumb_folder_id = self._match_breadcrumb(widget)
+        if is_breadcrumb:
+            if self._drag_target is not None:
+                self._drag_target.set_drop_highlight(False)
+                self._drag_target = None
+            self._drag_mode = None
+            self._drag_side = None
+            self._drag_target_kind = "breadcrumb"
+            self._drag_breadcrumb_folder_id = breadcrumb_folder_id
+            self._set_breadcrumb_highlight(widget)
+            if self._drop_indicator is not None:
+                self._drop_indicator.place_forget()
+            return
+
+        self._set_breadcrumb_highlight(None)
+        self._drag_target_kind = "tile"
+
         target = self._find_tile_ancestor(widget)
-        if target is self._drag_source:
+        if target is not None and target.item["id"] in dragged_ids:
             target = None
 
         mode: str | None = None
@@ -603,46 +736,53 @@ class AccesosDirectosApp:
 
     def end_drag(self, x_root: int, y_root: int) -> None:
         self.update_drag(x_root, y_root)
-        source = self._drag_source
+        sources = self._drag_sources
         target = self._drag_target
         mode = self._drag_mode
         side = self._drag_side
+        target_kind = self._drag_target_kind
+        breadcrumb_folder_id = self._drag_breadcrumb_folder_id
 
         if target is not None:
             target.set_drop_highlight(False)
+        self._set_breadcrumb_highlight(None)
         if self._drop_indicator is not None:
             self._drop_indicator.destroy()
             self._drop_indicator = None
         if self._drag_ghost is not None:
             self._drag_ghost.destroy()
             self._drag_ghost = None
-        if source is not None:
-            source.configure(cursor="hand2")
-            source.set_dragging(False)
+
+        for item in sources:
+            source_tile = self._tile_by_id.get(item["id"])
+            if source_tile is not None:
+                source_tile.configure(cursor="hand2")
+                source_tile.set_dragging(False)
 
         self._drag_source = None
+        self._drag_sources = []
         self._drag_target = None
         self._drag_mode = None
         self._drag_side = None
+        self._drag_target_kind = None
+        self._drag_breadcrumb_folder_id = None
 
-        if source is None:
+        if not sources:
+            return
+
+        if target_kind == "breadcrumb":
+            self._move_items_to_folder(sources, breadcrumb_folder_id)
             return
 
         if target is None:
-            # Soltado en un hueco vacío: se coloca al final de esta carpeta.
-            dragged = source.item
-            dragged["parent_id"] = self.current_folder_id
-            siblings = [
-                it
-                for it in self.shortcuts
-                if it["parent_id"] == self.current_folder_id and it["id"] != dragged["id"]
-            ]
-            dragged["order"] = len(siblings)
-            save_shortcuts(self.shortcuts)
-            self._layout_tiles()
+            # Soltado en un hueco vacío: se colocan al final de esta carpeta.
+            self._move_items_to_folder(sources, self.current_folder_id)
             return
 
-        self._apply_drop(source.item, target.item, mode, side)
+        if mode == "into":
+            self._move_items_to_folder(sources, target.item["id"])
+        else:
+            self._insert_items(sources, target.item, side)
 
     def _find_tile_ancestor(self, widget) -> Tile | None:
         while widget is not None:
@@ -651,27 +791,38 @@ class AccesosDirectosApp:
             widget = getattr(widget, "master", None)
         return None
 
-    def _apply_drop(self, dragged: dict, target: dict, mode: str | None, side: str | None) -> None:
-        if mode == "into":
-            dragged["parent_id"] = target["id"]
-            siblings = [
-                it for it in self.shortcuts if it["parent_id"] == target["id"] and it["id"] != dragged["id"]
-            ]
-            dragged["order"] = len(siblings)
-        else:
-            dragged["parent_id"] = target["parent_id"]
-            siblings = [
-                it
-                for it in self.shortcuts
-                if it["parent_id"] == dragged["parent_id"] and it["id"] != dragged["id"]
-            ]
-            target_index = next(
-                (idx for idx, it in enumerate(siblings) if it["id"] == target["id"]), len(siblings)
-            )
-            insert_at = target_index if side == "before" else target_index + 1
-            siblings.insert(insert_at, dragged)
-            for idx, it in enumerate(siblings):
-                it["order"] = idx
+    def _move_items_to_folder(self, items: list[dict], folder_id: str | None) -> None:
+        moved_ids = {it["id"] for it in items}
+        items_sorted = sorted(items, key=lambda it: it.get("order", 0))
+        existing = [
+            it for it in self.shortcuts if it["parent_id"] == folder_id and it["id"] not in moved_ids
+        ]
+        start = len(existing)
+        for offset, it in enumerate(items_sorted):
+            it["parent_id"] = folder_id
+            it["order"] = start + offset
+
+        save_shortcuts(self.shortcuts)
+        self._layout_tiles()
+
+    def _insert_items(self, items: list[dict], target: dict, side: str | None) -> None:
+        parent_id = target["parent_id"]
+        moved_ids = {it["id"] for it in items}
+        siblings = [
+            it for it in self.shortcuts if it["parent_id"] == parent_id and it["id"] not in moved_ids
+        ]
+        siblings.sort(key=lambda it: it.get("order", 0))
+        target_index = next(
+            (idx for idx, it in enumerate(siblings) if it["id"] == target["id"]), len(siblings)
+        )
+        insert_at = target_index if side == "before" else target_index + 1
+
+        items_sorted = sorted(items, key=lambda it: it.get("order", 0))
+        for it in items_sorted:
+            it["parent_id"] = parent_id
+        siblings[insert_at:insert_at] = items_sorted
+        for idx, it in enumerate(siblings):
+            it["order"] = idx
 
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
@@ -682,6 +833,16 @@ class AccesosDirectosApp:
 
     def show_tile_menu(self, tile: Tile, event: tk.Event) -> None:
         item = tile.item
+
+        if item["id"] in self.selected_ids and len(self.selected_ids) > 1:
+            self._show_multi_tile_menu(event)
+            return
+
+        if self.selected_ids:
+            self.selected_ids.clear()
+            self._selection_anchor_id = None
+            self._layout_tiles()
+
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Abrir", command=lambda: self.open_item(item))
 
@@ -693,16 +854,56 @@ class AccesosDirectosApp:
         menu.add_cascade(label="Tamaño", menu=size_menu)
 
         menu.add_command(label="Cambiar color...", command=lambda: self._set_item_color(item))
-        if item.get("color"):
-            menu.add_command(label="Quitar color personalizado", command=lambda: self._clear_item_color(item))
+        menu.add_command(
+            label="Restablecer color del tema",
+            command=lambda: self._clear_item_color(item),
+            state="normal" if item.get("color") else "disabled",
+        )
 
         menu.add_command(label="Renombrar...", command=lambda: self._rename_item(item))
+
+        if self.current_folder_id is not None:
+            menu.add_command(
+                label="Mover a la carpeta superior",
+                command=lambda: self._move_item_to_parent(item),
+            )
+
         menu.add_separator()
 
         if item["type"] == "folder":
             menu.add_command(label="Eliminar carpeta...", command=lambda: self._delete_folder(item))
         else:
             menu.add_command(label="Quitar acceso", command=lambda: self._delete_shortcut(item))
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _show_multi_tile_menu(self, event: tk.Event) -> None:
+        ids = set(self.selected_ids)
+        items = [it for it in self.shortcuts if it["id"] in ids]
+        if not items:
+            return
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"{len(items)} elementos seleccionados", state="disabled")
+        menu.add_separator()
+
+        if self.current_folder_id is not None:
+            menu.add_command(
+                label="Mover a la carpeta superior",
+                command=lambda: self._move_items_to_parent(items),
+            )
+
+        menu.add_command(
+            label="Restablecer color del tema",
+            command=lambda: self._clear_items_color(items),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=f"Eliminar {len(items)} elementos...",
+            command=lambda: self._delete_items(items),
+        )
+        menu.add_separator()
+        menu.add_command(label="Deseleccionar todo", command=self._clear_selection)
 
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -721,6 +922,26 @@ class AccesosDirectosApp:
 
     def _clear_item_color(self, item: dict) -> None:
         item["color"] = None
+        save_shortcuts(self.shortcuts)
+        self._layout_tiles()
+
+    def _move_item_to_parent(self, item: dict) -> None:
+        self._move_items_to_parent([item])
+
+    def _move_items_to_parent(self, items: list[dict]) -> None:
+        # Solo tiene sentido dentro de una carpeta: sube los elementos al
+        # nivel que contiene a la carpeta actual (su "carpeta madre").
+        if self.current_folder_id is None:
+            return
+        current_folder = next(
+            (it for it in self.shortcuts if it["id"] == self.current_folder_id), None
+        )
+        grandparent_id = current_folder["parent_id"] if current_folder else None
+        self._move_items_to_folder(items, grandparent_id)
+
+    def _clear_items_color(self, items: list[dict]) -> None:
+        for item in items:
+            item["color"] = None
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
 
@@ -756,6 +977,31 @@ class AccesosDirectosApp:
                 return
 
         self.shortcuts = [it for it in self.shortcuts if it["id"] != item["id"]]
+        save_shortcuts(self.shortcuts)
+        self._layout_tiles()
+
+    def _delete_items(self, items: list[dict]) -> None:
+        names_preview = ", ".join(it["name"] for it in items[:5])
+        if len(items) > 5:
+            names_preview += "…"
+        if not messagebox.askyesno(
+            "Eliminar elementos",
+            f"¿Eliminar {len(items)} elementos?\n\n{names_preview}\n\n"
+            "El contenido de las carpetas eliminadas se moverá fuera de ellas "
+            "(no se borrará).",
+        ):
+            return
+
+        ids = {it["id"] for it in items}
+        for item in items:
+            if item["type"] == "folder":
+                children = [c for c in self.shortcuts if c["parent_id"] == item["id"]]
+                for child in children:
+                    child["parent_id"] = item["parent_id"]
+
+        self.shortcuts = [it for it in self.shortcuts if it["id"] not in ids]
+        self.selected_ids.clear()
+        self._selection_anchor_id = None
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
 
