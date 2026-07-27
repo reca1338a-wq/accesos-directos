@@ -171,10 +171,28 @@ def _apply_update_exe(download_url: str, token: str = "", latest_version: str = 
             pass
 
 
+def restart_app() -> None:
+    """Reinicia la aplicación de forma segura.
+
+    En modo fuente (python main.py) usamos os.execv, que funciona bien.
+    En el .exe empaquetado con PyInstaller, os.execv NO es seguro: rompe
+    las variables de entorno que el intérprete embebido necesita, dando
+    errores como "Failed to import encodings module". En su lugar,
+    lanzamos una copia nueva del propio .exe y cerramos esta con
+    normalidad, dejando que el bootloader limpie su carpeta temporal
+    correctamente.
+    """
+    if getattr(sys, "frozen", False):
+        subprocess.Popen([sys.executable])
+        sys.exit(0)
+    else:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 def restart_with_update() -> None:
     """Sustituye el .exe actual por el descargado (si lo hay) y reinicia la app."""
     if not getattr(sys, "frozen", False):
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        restart_app()
         return
 
     current_exe = Path(sys.executable).resolve()
@@ -182,7 +200,7 @@ def restart_with_update() -> None:
 
     if not new_exe.exists():
         # No hay actualización pendiente, reinicio normal.
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        restart_app()
         return
 
     # En Windows no se puede sobrescribir un .exe mientras se está ejecutando,

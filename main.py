@@ -34,6 +34,7 @@ from github_updates import (
     apply_update,
     check_for_updates,
     cleanup_stale_update_files,
+    restart_app,
     restart_with_update,
 )
 
@@ -145,7 +146,13 @@ class Tile(tk.Frame):
 
     def set_drop_highlight(self, on: bool) -> None:
         color = self.app.colors["accent"] if on else self.base_bg
-        self.configure(highlightbackground=color)
+        self.configure(highlightbackground=color, highlightthickness=3 if on else 2)
+
+    def set_dragging(self, on: bool) -> None:
+        # Marca claramente cuál tarjeta se está moviendo: borde grueso de
+        # color de acento, para que no haya duda de cuál es.
+        color = self.app.colors["accent"] if on else self.base_bg
+        self.configure(highlightbackground=color, highlightthickness=3 if on else 2)
 
     # -- interacción -----------------------------------------------------
 
@@ -197,6 +204,10 @@ class AccesosDirectosApp:
         self._resize_after_id: str | None = None
         self._drag_source: Tile | None = None
         self._drag_target: Tile | None = None
+        self._drag_mode: str | None = None  # "into" o "insert"
+        self._drag_side: str | None = None  # "before" o "after"
+        self._drag_ghost: tk.Toplevel | None = None
+        self._drop_indicator: tk.Frame | None = None
         self._last_click_time = 0.0
         self._last_click_id: str | None = None
 
@@ -521,35 +532,117 @@ class AccesosDirectosApp:
     def begin_drag(self, tile: Tile) -> None:
         self._drag_source = tile
         tile.configure(cursor="fleur")
+        tile.set_dragging(True)
+        self._create_drag_ghost(tile.item)
+        self._drop_indicator = tk.Frame(self.scrollable, bg=self.colors["accent"])
+
+    def _create_drag_ghost(self, item: dict) -> None:
+        colors = self.colors
+        ghost = tk.Toplevel(self.root)
+        ghost.overrideredirect(True)
+        try:
+            ghost.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        ghost.configure(bg=colors["accent"])
+        icon = "📁" if item["type"] == "folder" else "📄"
+        tk.Label(
+            ghost,
+            text=f"{icon}  {item['name']}",
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["bg"],
+            bg=colors["accent"],
+            padx=10,
+            pady=6,
+        ).pack()
+        self._drag_ghost = ghost
 
     def update_drag(self, x_root: int, y_root: int) -> None:
+        # La tarjeta fantasma sigue al cursor con un pequeño desplazamiento
+        # para no taparlo, dejando claro qué se está moviendo.
+        if self._drag_ghost is not None:
+            self._drag_ghost.geometry(f"+{x_root + 16}+{y_root + 12}")
+
         widget = self.root.winfo_containing(x_root, y_root)
         target = self._find_tile_ancestor(widget)
         if target is self._drag_source:
             target = None
-        if target is not self._drag_target:
-            if self._drag_target is not None:
-                self._drag_target.set_drop_highlight(False)
-            self._drag_target = target
-            if target is not None:
-                target.set_drop_highlight(True)
+
+        mode: str | None = None
+        side: str | None = None
+        if target is not None:
+            local_x = x_root - target.winfo_rootx()
+            ratio = local_x / max(target.winfo_width(), 1)
+            if target.item["type"] == "folder" and 0.22 <= ratio <= 0.78:
+                mode = "into"
+            else:
+                mode = "insert"
+                side = "before" if ratio < 0.5 else "after"
+
+        if self._drag_target is not None and self._drag_target is not target:
+            self._drag_target.set_drop_highlight(False)
+        if target is not None:
+            target.set_drop_highlight(mode == "into")
+
+        self._drag_target = target
+        self._drag_mode = mode
+        self._drag_side = side
+
+        if self._drop_indicator is None:
+            return
+        if target is not None and mode == "insert":
+            x = (
+                target.winfo_x() - 2
+                if side == "before"
+                else target.winfo_x() + target.winfo_width() - 2
+            )
+            self._drop_indicator.place(x=x, y=target.winfo_y(), width=4, height=target.winfo_height())
+            self._drop_indicator.lift()
+        else:
+            self._drop_indicator.place_forget()
 
     def end_drag(self, x_root: int, y_root: int) -> None:
         self.update_drag(x_root, y_root)
         source = self._drag_source
         target = self._drag_target
+        mode = self._drag_mode
+        side = self._drag_side
 
         if target is not None:
             target.set_drop_highlight(False)
+        if self._drop_indicator is not None:
+            self._drop_indicator.destroy()
+            self._drop_indicator = None
+        if self._drag_ghost is not None:
+            self._drag_ghost.destroy()
+            self._drag_ghost = None
         if source is not None:
             source.configure(cursor="hand2")
+            source.set_dragging(False)
 
         self._drag_source = None
         self._drag_target = None
+        self._drag_mode = None
+        self._drag_side = None
 
-        if source is None or target is None:
+        if source is None:
             return
-        self._apply_drop(source.item, target.item)
+
+        if target is None:
+            # Soltado en un hueco vacío: se coloca al final de esta carpeta.
+            dragged = source.item
+            dragged["parent_id"] = self.current_folder_id
+            siblings = [
+                it
+                for it in self.shortcuts
+                if it["parent_id"] == self.current_folder_id and it["id"] != dragged["id"]
+            ]
+            dragged["order"] = len(siblings)
+            save_shortcuts(self.shortcuts)
+            self._layout_tiles()
+            return
+
+        self._apply_drop(source.item, target.item, mode, side)
 
     def _find_tile_ancestor(self, widget) -> Tile | None:
         while widget is not None:
@@ -558,8 +651,8 @@ class AccesosDirectosApp:
             widget = getattr(widget, "master", None)
         return None
 
-    def _apply_drop(self, dragged: dict, target: dict) -> None:
-        if target["type"] == "folder" and target["id"] != dragged["id"]:
+    def _apply_drop(self, dragged: dict, target: dict, mode: str | None, side: str | None) -> None:
+        if mode == "into":
             dragged["parent_id"] = target["id"]
             siblings = [
                 it for it in self.shortcuts if it["parent_id"] == target["id"] and it["id"] != dragged["id"]
@@ -575,7 +668,8 @@ class AccesosDirectosApp:
             target_index = next(
                 (idx for idx, it in enumerate(siblings) if it["id"] == target["id"]), len(siblings)
             )
-            siblings.insert(target_index, dragged)
+            insert_at = target_index if side == "before" else target_index + 1
+            siblings.insert(insert_at, dragged)
             for idx, it in enumerate(siblings):
                 it["order"] = idx
 
@@ -925,7 +1019,7 @@ class AccesosDirectosApp:
             if theme_changed and messagebox.askyesno(
                 "Reiniciar", "El tema ha cambiado. ¿Reiniciar ahora para aplicarlo?"
             ):
-                os.execv(sys.executable, [sys.executable, *sys.argv])
+                restart_app()
 
         buttons = tk.Frame(dialog, bg=colors["bg"], pady=14)
         buttons.pack(fill="x", padx=18)
