@@ -2,6 +2,9 @@
 # Instalar con: pip install -r requirements.txt
 # (iniciar.bat ya lo hace automáticamente si detecta que faltan)
 
-pywin32>=306; sys_platform == "win32"   # Iconos reales de Windows para cada acceso.
-Pillow>=10.0.0                          # Conversión de iconos a imágenes que Tkinter puede mostrar.
+Pillow>=10.0.0                          # Iconos reales de Windows y miniaturas de imagen.
 tkinterdnd2>=0.3.0                      # Arrastrar archivos desde el Explorador de Windows.
+
+# Nota: los iconos de Windows ya NO usan pywin32 (daba muchos problemas de
+# empaquetado con PyInstaller). Se piden directamente con ctypes, que ya
+# viene incluido en Python, así que no hace falta instalar nada más.

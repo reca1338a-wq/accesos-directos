@@ -1683,7 +1683,93 @@ class AccesosDirectosApp:
         self.root.mainloop()
 
 
+def _missing_optional_dependencies() -> list[str]:
+    """Comprueba (sin instalar nada) qué paquetes opcionales faltan.
+
+    Solo tiene sentido en modo fuente: el .exe compilado ya debería
+    llevarlos empaquetados dentro (ver main.spec), así que si faltan ahí
+    es un problema de cómo se compiló, no algo que arreglar en tiempo de
+    ejecución en el equipo de un usuario final.
+    """
+    missing = []
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        missing.append("Pillow")
+    try:
+        import tkinterdnd2  # noqa: F401
+    except ImportError:
+        missing.append("tkinterdnd2")
+    return missing
+
+
+def _offer_dependency_install(missing: list[str]) -> None:
+    """Pregunta si se instalan las dependencias que faltan y, si se
+    acepta, las instala con pip y reinicia la app. Nunca se llama en el
+    .exe compilado (ver _missing_optional_dependencies)."""
+    import subprocess
+
+    prompt_root = tk.Tk()
+    prompt_root.withdraw()
+
+    install = messagebox.askyesno(
+        "Funciones adicionales disponibles",
+        "Accesos Directos puede mostrar los iconos reales de Windows y "
+        "permitir arrastrar archivos desde el Explorador, pero necesita "
+        "instalar estas librerías de Python (una sola vez):\n\n"
+        f"  •  {', '.join(missing)}\n\n"
+        "Ocupan aproximadamente 10-15 MB en total (el tamaño exacto "
+        "depende de tu versión de Windows y Python) y se descargan desde "
+        "pypi.org, el repositorio oficial de paquetes de Python.\n\n"
+        "¿Instalarlas ahora? Si dices que no, la app funciona igual, "
+        "pero con iconos genéricos y sin arrastrar-soltar.",
+        parent=prompt_root,
+    )
+    if not install:
+        prompt_root.destroy()
+        return
+
+    progress = tk.Toplevel(prompt_root)
+    progress.title("Instalando...")
+    progress.geometry("360x110")
+    tk.Label(progress, text="Instalando dependencias, un momento...", pady=24).pack()
+    progress.update()
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "--quiet"],
+            check=True,
+        )
+    except Exception as exc:
+        progress.destroy()
+        messagebox.showerror(
+            "Error al instalar",
+            f"No se pudieron instalar las dependencias:\n{exc}\n\n"
+            "La app se abrirá igualmente, con funciones limitadas.",
+            parent=prompt_root,
+        )
+        prompt_root.destroy()
+        return
+
+    progress.destroy()
+    messagebox.showinfo(
+        "Instalación completada",
+        "Listo. La aplicación se va a reiniciar para activarlo.",
+        parent=prompt_root,
+    )
+    prompt_root.destroy()
+    restart_app()
+
+
 def main() -> None:
+    # El .exe compilado ya lleva sus dependencias empaquetadas dentro
+    # (ver main.spec); esta comprobación solo aplica cuando se ejecuta
+    # el código fuente directamente.
+    if not getattr(sys, "frozen", False):
+        missing = _missing_optional_dependencies()
+        if missing:
+            _offer_dependency_install(missing)
+
     AccesosDirectosApp().run()
 
 
