@@ -17,6 +17,12 @@ from pathlib import Path
 
 from app_config import APP_DIR, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, VERSION_FILE, get_app_version
 
+# Se añade a los argumentos de la nueva instancia cuando se relanza la app
+# muy rápido (tras cambiar el tema o tras actualizar), para que sepa que
+# debe darle un momento a la caché de iconos de Windows antes de pintar
+# las tarjetas (ver AccesosDirectosApp.__init__ en main.py).
+WARM_RESTART_FLAG = "--warm-restart"
+
 UPDATE_FILES = (
     "main.py",
     "iniciar.bat",
@@ -179,7 +185,27 @@ def _apply_update_exe(download_url: str, token: str = "", latest_version: str = 
             pass
 
 
-def restart_app() -> None:
+def _close_window(root) -> None:
+    """Cierra la ventana principal de Tk de forma limpia antes de salir.
+
+    Si el proceso termina (sys.exit / os.execv) mientras aún hay callbacks
+    pendientes (un after() programado, un hilo en segundo plano
+    comprobando actualizaciones...) que luego intentan tocar la ventana,
+    Tkinter puede lanzar una excepción al intentar reportarla por
+    sys.stderr — y en el .exe (app "windowed", sin consola) eso se
+    traduce en la ventana de error que PyInstaller muestra al detectar una
+    excepción no capturada. Destruir la ventana primero, de forma
+    explícita, evita esa condición de carrera en la mayoría de los casos.
+    """
+    if root is None:
+        return
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+
+def restart_app(root=None) -> None:
     """Reinicia la aplicación de forma segura.
 
     En modo fuente (python main.py) usamos os.execv, que funciona bien.
@@ -189,18 +215,24 @@ def restart_app() -> None:
     lanzamos una copia nueva del propio .exe y cerramos esta con
     normalidad, dejando que el bootloader limpie su carpeta temporal
     correctamente.
+
+    `root`, si se indica, es la ventana principal de Tk: se cierra de
+    forma explícita antes de terminar el proceso actual (ver
+    `_close_window`).
     """
     if getattr(sys, "frozen", False):
-        subprocess.Popen([sys.executable])
+        subprocess.Popen([sys.executable, WARM_RESTART_FLAG])
+        _close_window(root)
         sys.exit(0)
     else:
+        _close_window(root)
         os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
-def restart_with_update() -> None:
+def restart_with_update(root=None) -> None:
     """Sustituye el .exe actual por el descargado (si lo hay) y reinicia la app."""
     if not getattr(sys, "frozen", False):
-        restart_app()
+        restart_app(root)
         return
 
     current_exe = Path(sys.executable).resolve()
@@ -208,7 +240,7 @@ def restart_with_update() -> None:
 
     if not new_exe.exists():
         # No hay actualización pendiente, reinicio normal.
-        restart_app()
+        restart_app(root)
         return
 
     # En Windows no se puede sobrescribir un .exe mientras se está ejecutando,
@@ -243,11 +275,12 @@ def restart_with_update() -> None:
         ")\n"
         'if exist "%NEW%" del /f /q "%NEW%"\n'
         "timeout /t 1 /nobreak >nul\n"
-        'start "" "%CURRENT%"\n'
+        f'start "" "%CURRENT%" {WARM_RESTART_FLAG}\n'
         'del "%~f0"\n',
         encoding="utf-8",
     )
     subprocess.Popen(["cmd", "/c", str(updater)], creationflags=subprocess.CREATE_NO_WINDOW)
+    _close_window(root)
     sys.exit(0)
 
 

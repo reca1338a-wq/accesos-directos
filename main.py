@@ -4,6 +4,22 @@ from __future__ import annotations
 
 import os
 import sys
+
+# El .exe se compila como app "windowed" (sin consola, ver main.spec:
+# console=False), y en ese modo Windows/PyInstaller dejan sys.stdout y
+# sys.stderr en None. Si algo intenta escribir ahí (un print() nuestro, o
+# el manejador de errores por defecto de Tkinter, que imprime a stderr
+# cualquier excepción no capturada dentro de un callback) salta
+# "AttributeError: 'NoneType' object has no attribute 'write'" — una
+# excepción *nueva y distinta* de la original, que es la que PyInstaller
+# acaba mostrando como "un error" al reiniciar o hacer casi cualquier cosa
+# que dispare una excepción de fondo. Redirigirlos a un sumidero nulo evita
+# ese crash secundario y dijamos ver el error real si hace falta depurar.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import threading
 import time
 import tkinter as tk
@@ -31,6 +47,7 @@ from app_config import (
     save_shortcuts,
 )
 from github_updates import (
+    WARM_RESTART_FLAG,
     UpdateError,
     apply_update,
     check_for_updates,
@@ -232,6 +249,16 @@ class AccesosDirectosApp:
     def __init__(self) -> None:
         cleanup_stale_update_files()
 
+        if WARM_RESTART_FLAG in sys.argv:
+            # Venimos de un reinicio rápido (tras cambiar el tema o tras
+            # actualizar): si pedimos los iconos reales de Windows
+            # demasiado pronto tras arrancar el proceso, la caché de
+            # iconos de Shell a veces todavía no está "caliente" y
+            # devuelve el icono genérico en vez del real (por eso cerrar
+            # y volver a abrir la app a mano —que tarda más— no tiene
+            # este problema). Una pequeña espera aquí es suficiente.
+            time.sleep(0.6)
+
         self.settings = load_settings()
         self.colors = get_theme(self.settings.get("theme"))
         self.shortcuts = load_shortcuts()
@@ -271,6 +298,17 @@ class AccesosDirectosApp:
         self._layout_tiles()
 
         self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
+
+        # Navegación con flechas por la cuadrícula de tarjetas (ver
+        # _build_search_box para cómo se entra en este modo desde el
+        # buscador). Se atan a la ventana principal, así que solo actúan
+        # cuando el foco está en ella (no mientras se escribe en el
+        # buscador ni dentro de un diálogo).
+        self.root.bind("<Down>", self._on_grid_down)
+        self.root.bind("<Up>", self._on_grid_up)
+        self.root.bind("<Left>", self._on_grid_left)
+        self.root.bind("<Right>", self._on_grid_right)
+        self.root.bind("<Return>", self._on_grid_return)
 
         self.root.after(1500, self._maybe_check_updates_on_startup)
         self.root.after(UPDATE_CHECK_INTERVAL_MS, self._auto_check_loop)
@@ -462,6 +500,8 @@ class AccesosDirectosApp:
         )
         self.search_entry.pack(side="left", ipady=5)
         self.search_var.trace_add("write", lambda *_a: self._on_search_changed())
+        self.search_entry.bind("<Return>", self._on_search_enter)
+        self.search_entry.bind("<Down>", self._on_search_down)
 
         self.search_clear_btn = tk.Label(
             wrap, text="✕", font=("Segoe UI", 9), fg=colors["text_muted"], bg=colors["surface"],
@@ -514,11 +554,194 @@ class AccesosDirectosApp:
 
     def _on_search_changed(self) -> None:
         self._render_breadcrumb()
+        # Al escribir en el buscador, resaltamos siempre el primer
+        # resultado como "elegido por defecto": así Intro abre ese acceso
+        # sin tener que tocar el ratón ni las flechas.
+        if self._is_searching():
+            items = self._visible_items()
+            if items:
+                self.selected_ids = {items[0]["id"]}
+                self._selection_anchor_id = items[0]["id"]
+            else:
+                self.selected_ids.clear()
+                self._selection_anchor_id = None
+        else:
+            self.selected_ids.clear()
+            self._selection_anchor_id = None
         self._layout_tiles()
 
     def _clear_search(self) -> None:
         self.search_var.set("")
         self.root.focus_set()
+
+    # ------------------------------------------------------------------
+    # Navegación por teclado desde el buscador y por la cuadrícula
+    # ------------------------------------------------------------------
+
+    def _selected_visible_item(self) -> dict | None:
+        """El único elemento actualmente resaltado, si sigue siendo
+        visible con el filtro/carpeta actual (None si no hay ninguno o
+        hay varios seleccionados)."""
+        if len(self.selected_ids) != 1:
+            return None
+        item_id = next(iter(self.selected_ids))
+        return next((it for it in self._visible_items() if it["id"] == item_id), None)
+
+    def _select_item_id(self, item_id: str, *, scroll: bool = True) -> None:
+        self.selected_ids = {item_id}
+        self._selection_anchor_id = item_id
+        self._layout_tiles()
+        if scroll:
+            self._scroll_tile_into_view(item_id)
+
+    def _scroll_tile_into_view(self, item_id: str) -> None:
+        tile = self._tile_by_id.get(item_id)
+        if tile is None:
+            return
+        self.canvas.update_idletasks()
+        canvas_height = self.canvas.winfo_height()
+        scroll_height = max(self.scrollable.winfo_height(), 1)
+        tile_top = tile.winfo_y()
+        tile_bottom = tile_top + tile.winfo_height()
+        top, bottom = self.canvas.yview()
+        visible_top = top * scroll_height
+        visible_bottom = bottom * scroll_height
+        if tile_top < visible_top:
+            self.canvas.yview_moveto(max(0, tile_top - TILE_GAP) / scroll_height)
+        elif tile_bottom > visible_bottom:
+            self.canvas.yview_moveto(
+                max(0, tile_bottom + TILE_GAP - canvas_height) / scroll_height
+            )
+
+    def _on_search_enter(self, _event=None) -> str:
+        """Intro en el buscador: abre el resultado resaltado (el primero
+        por defecto) sin necesidad de tocar el ratón."""
+        items = self._visible_items()
+        if not items:
+            return "break"
+        target = self._selected_visible_item() or items[0]
+        self.open_item(target)
+        return "break"
+
+    def _on_search_down(self, _event=None) -> str:
+        """Flecha abajo en el buscador: baja el foco a la cuadrícula de
+        resultados, donde ya se puede navegar con las flechas."""
+        items = self._visible_items()
+        if not items:
+            return "break"
+        current = self._selected_visible_item()
+        if current is None:
+            self._select_item_id(items[0]["id"])
+        self.root.focus_set()
+        return "break"
+
+    def _tile_rows(self) -> list[list[dict]]:
+        """Agrupa los elementos visibles en filas, en el mismo orden en
+        que _layout_tiles los coloca, para poder mover la selección hacia
+        arriba/abajo de forma coherente con lo que se ve en pantalla."""
+        items = self._visible_items()
+        canvas_width = max(self.canvas.winfo_width(), 240)
+        rows: list[list[dict]] = []
+        current_row: list[dict] = []
+        x = TILE_GAP
+        for item in items:
+            preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
+            width = preset["width"]
+            if x + width + TILE_GAP > canvas_width and x > TILE_GAP:
+                rows.append(current_row)
+                current_row = []
+                x = TILE_GAP
+            current_row.append(item)
+            x += width + TILE_GAP
+        if current_row:
+            rows.append(current_row)
+        return rows
+
+    def _focus_is_text_entry(self) -> bool:
+        focus = self.root.focus_get()
+        return isinstance(focus, (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox))
+
+    def _on_grid_left(self, _event=None) -> str | None:
+        if self._focus_is_text_entry():
+            return None
+        items = self._visible_items()
+        if not items:
+            return "break"
+        ids = [it["id"] for it in items]
+        current = self._selected_visible_item()
+        idx = ids.index(current["id"]) if current else 0
+        self._select_item_id(ids[max(0, idx - 1)])
+        return "break"
+
+    def _on_grid_right(self, _event=None) -> str | None:
+        if self._focus_is_text_entry():
+            return None
+        items = self._visible_items()
+        if not items:
+            return "break"
+        ids = [it["id"] for it in items]
+        current = self._selected_visible_item()
+        idx = ids.index(current["id"]) if current else -1
+        self._select_item_id(ids[min(len(ids) - 1, idx + 1)])
+        return "break"
+
+    def _on_grid_down(self, _event=None) -> str | None:
+        if self._focus_is_text_entry():
+            return None
+        rows = self._tile_rows()
+        if not rows:
+            return "break"
+        current = self._selected_visible_item()
+        if current is None:
+            self._select_item_id(rows[0][0]["id"])
+            return "break"
+        for row_idx, row in enumerate(rows):
+            for col_idx, item in enumerate(row):
+                if item["id"] == current["id"]:
+                    if row_idx + 1 < len(rows):
+                        next_row = rows[row_idx + 1]
+                        target = next_row[min(col_idx, len(next_row) - 1)]
+                        self._select_item_id(target["id"])
+                    return "break"
+        self._select_item_id(rows[0][0]["id"])
+        return "break"
+
+    def _on_grid_up(self, _event=None) -> str | None:
+        if self._focus_is_text_entry():
+            return None
+        rows = self._tile_rows()
+        if not rows:
+            return "break"
+        current = self._selected_visible_item()
+        if current is None:
+            self._select_item_id(rows[0][0]["id"])
+            return "break"
+        for row_idx, row in enumerate(rows):
+            for col_idx, item in enumerate(row):
+                if item["id"] == current["id"]:
+                    if row_idx == 0:
+                        # Ya estamos en la primera fila: volvemos el foco
+                        # al buscador, como haría cualquier lista con
+                        # cabecera de búsqueda.
+                        self.search_entry.focus_set()
+                        self.search_entry.icursor("end")
+                    else:
+                        prev_row = rows[row_idx - 1]
+                        target = prev_row[min(col_idx, len(prev_row) - 1)]
+                        self._select_item_id(target["id"])
+                    return "break"
+        self._select_item_id(rows[0][0]["id"])
+        return "break"
+
+    def _on_grid_return(self, _event=None) -> str | None:
+        if self._focus_is_text_entry():
+            return None
+        items = self._visible_items()
+        if not items:
+            return "break"
+        target = self._selected_visible_item() or items[0]
+        self.open_item(target)
+        return "break"
 
     def _on_escape(self) -> None:
         if self.search_var.get():
@@ -1489,7 +1712,7 @@ class AccesosDirectosApp:
             if theme_changed and messagebox.askyesno(
                 "Reiniciar", "El tema ha cambiado. ¿Reiniciar ahora para aplicarlo?"
             ):
-                restart_app()
+                restart_app(self.root)
 
         buttons = tk.Frame(dialog, bg=colors["bg"], pady=14)
         buttons.pack(fill="x", padx=18)
@@ -1673,7 +1896,7 @@ class AccesosDirectosApp:
                     "¿Reiniciar ahora para aplicar los cambios?",
                 )
                 if restart:
-                    restart_with_update()
+                    restart_with_update(self.root)
 
             self.root.after(0, done)
 
