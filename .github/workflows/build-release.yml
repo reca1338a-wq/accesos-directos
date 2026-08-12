@@ -1,12 +1,13 @@
 name: Compilar y publicar el .exe
 
-# Se ejecuta automáticamente cuando subes un tag de versión (ej. v1.4.0),
-# y también se puede lanzar a mano desde la pestaña "Actions" de GitHub
-# (botón "Run workflow") para probarlo sin necesidad de crear un tag.
+# Se ejecuta automáticamente cuando subes un tag de versión (ej. 2.1.1 o
+# v2.1.1, ambos valen), y también se puede lanzar a mano desde la pestaña
+# "Actions" de GitHub (botón "Run workflow"), sin necesitar un tag.
 on:
   push:
     tags:
       - "v*"
+      - "*.*.*"
   workflow_dispatch:
 
 permissions:
@@ -36,9 +37,15 @@ jobs:
       - name: Compilar el .exe
         run: pyinstaller main.spec
 
+      - name: Leer la versión desde VERSION
+        id: version
+        shell: bash
+        run: echo "value=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Publicar como Release en GitHub
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.value }}
           files: dist/main.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
