@@ -40,11 +40,14 @@ from app_config import (
     get_app_version,
     get_theme,
     import_shortcuts,
+    is_startup_enabled,
     load_settings,
     load_shortcuts,
     new_item_id,
     save_settings,
     save_shortcuts,
+    set_startup_enabled,
+    startup_supported,
 )
 from github_updates import (
     WARM_RESTART_FLAG,
@@ -1631,12 +1634,33 @@ class AccesosDirectosApp:
     # Configuración (clic y tema)
     # ------------------------------------------------------------------
 
+    def _apply_theme_live(self, theme_key: str) -> None:
+        """Aplica un tema nuevo reconstruyendo la interfaz en el mismo
+        proceso, sin reiniciar la app.
+
+        Antes esto se hacía relanzando el .exe (cerrar y abrir una nueva
+        instancia). Con el .exe empaquetado con PyInstaller ("onefile")
+        eso obliga a autoextraerse de nuevo en una carpeta temporal, justo
+        el momento en que el antivirus suele intervenir y a veces provoca
+        errores como "Failed to load Python DLL" o "Can't find a usable
+        init.tcl". Reconstruir la interfaz aquí mismo evita ese problema
+        por completo y además es instantáneo para quien lo usa.
+        """
+        self.colors = get_theme(theme_key)
+        self.root.configure(bg=self.colors["bg"])
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        self._tile_by_id = {}
+        self._build_ui()
+        self.root.update_idletasks()
+        self._layout_tiles()
+
     def open_settings_dialog(self) -> None:
         colors = self.colors
         dialog = tk.Toplevel(self.root)
         dialog.title("Configuración")
         dialog.configure(bg=colors["bg"])
-        dialog.geometry("360x300")
+        dialog.geometry("360x420" if startup_supported() else "360x300")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1668,21 +1692,34 @@ class AccesosDirectosApp:
                 highlightthickness=0,
             ).pack(anchor="w", padx=26)
 
-        tk.Label(
-            dialog, text="El tema se aplica al reiniciar la app.", font=("Segoe UI", 8),
-            fg=colors["text_muted"], bg=colors["bg"],
-        ).pack(anchor="w", padx=18, pady=(6, 0))
+        startup_var = tk.BooleanVar(value=is_startup_enabled())
+        if startup_supported():
+            tk.Label(
+                dialog, text="Inicio con Windows", font=("Segoe UI", 10, "bold"),
+                fg=colors["text"], bg=colors["bg"],
+            ).pack(anchor="w", padx=18, pady=(16, 4))
+            tk.Checkbutton(
+                dialog, text="Abrir la app al iniciar sesión en Windows", variable=startup_var,
+                fg=colors["text"], bg=colors["bg"], selectcolor=colors["surface"],
+                activebackground=colors["bg"], activeforeground=colors["text"],
+                highlightthickness=0,
+            ).pack(anchor="w", padx=26)
 
         def save_and_close() -> None:
             self.settings["click_mode"] = click_var.get()
             theme_changed = theme_var.get() != self.settings.get("theme")
             self.settings["theme"] = theme_var.get()
             save_settings(self.settings)
+            if startup_supported():
+                try:
+                    set_startup_enabled(startup_var.get())
+                except OSError as exc:
+                    messagebox.showerror(
+                        "Error", f"No se pudo cambiar el inicio con Windows:\n{exc}"
+                    )
             dialog.destroy()
-            if theme_changed and messagebox.askyesno(
-                "Reiniciar", "El tema ha cambiado. ¿Reiniciar ahora para aplicarlo?"
-            ):
-                restart_app(self.root)
+            if theme_changed:
+                self._apply_theme_live(self.settings["theme"])
 
         buttons = tk.Frame(dialog, bg=colors["bg"], pady=14)
         buttons.pack(fill="x", padx=18)

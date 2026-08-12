@@ -191,10 +191,26 @@ def _apply_update_exe(download_url: str, token: str = "", latest_version: str = 
 
     try:
         with urllib.request.urlopen(request, timeout=60) as response, new_exe.open("wb") as handle:
+            expected_size = response.getheader("Content-Length")
             shutil.copyfileobj(response, handle)
     except Exception as exc:
         new_exe.unlink(missing_ok=True)
         raise UpdateError(f"No se pudo descargar la actualización: {exc}") from exc
+
+    # Una descarga cortada a medias (conexión inestable) deja un .exe
+    # incompleto que arranca pero falla al autoextraerse con errores como
+    # "Failed to load Python DLL". Comprobar el tamaño contra el que
+    # anunció GitHub evita instalar un ejecutable roto.
+    actual_size = new_exe.stat().st_size
+    if expected_size and actual_size != int(expected_size):
+        new_exe.unlink(missing_ok=True)
+        raise UpdateError(
+            "La descarga de la actualización se interrumpió a medias "
+            f"({actual_size} de {expected_size} bytes). Vuelve a intentarlo."
+        )
+    if actual_size < 1_000_000:  # un .exe con Python+Tk embebido nunca pesa tan poco
+        new_exe.unlink(missing_ok=True)
+        raise UpdateError("El archivo descargado no parece un ejecutable válido. Vuelve a intentarlo.")
 
     # Actualizamos ya el número de versión mostrado, aunque el .exe se
     # sustituya realmente al reiniciar.
@@ -303,7 +319,14 @@ def restart_with_update(root=None) -> None:
         "  goto mover\n"
         ")\n"
         'if exist "%NEW%" del /f /q "%NEW%"\n'
-        "timeout /t 1 /nobreak >nul\n"
+        # Espera algo más antes de arrancar el .exe recién movido: el
+        # antivirus (Windows Defender incluido) suele analizar en segundo
+        # plano cualquier .exe nuevo o recién movido nada más aparecer, y
+        # si lo lanzamos mientras aún lo tiene abierto para escanearlo, el
+        # autoextraíble de PyInstaller puede fallar a mitad ("Failed to
+        # load Python DLL", "Can't find a usable init.tcl"). Este margen
+        # no lo evita al 100%, pero reduce mucho la probabilidad.
+        "timeout /t 3 /nobreak >nul\n"
         f'start "" "%CURRENT%" {WARM_RESTART_FLAG}\n'
         'del "%~f0"\n',
         encoding="utf-8",
