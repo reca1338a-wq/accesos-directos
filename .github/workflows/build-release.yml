@@ -1,0 +1,44 @@
+name: Compilar y publicar el .exe
+
+# Se ejecuta automáticamente cuando subes un tag de versión (ej. v1.4.0),
+# y también se puede lanzar a mano desde la pestaña "Actions" de GitHub
+# (botón "Run workflow") para probarlo sin necesidad de crear un tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Necesario para poder publicar el Release.
+
+jobs:
+  build:
+    # Máquina de Windows real proporcionada por GitHub: aquí sí se genera
+    # un .exe de Windows de verdad, a diferencia de compilar en Linux.
+    runs-on: windows-latest
+
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Compilar el .exe
+        run: pyinstaller main.spec
+
+      - name: Publicar como Release en GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/main.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
