@@ -500,8 +500,11 @@ class AccesosDirectosApp:
         )
         self.search_entry.pack(side="left", ipady=5)
         self.search_var.trace_add("write", lambda *_a: self._on_search_changed())
-        self.search_entry.bind("<Return>", self._on_search_enter)
-        self.search_entry.bind("<Down>", self._on_search_down)
+        self.search_entry.bind("<Return>", self._on_grid_return)
+        self.search_entry.bind("<Down>", self._on_grid_down)
+        self.search_entry.bind("<Up>", self._on_grid_up)
+        self.search_entry.bind("<Left>", self._on_grid_left)
+        self.search_entry.bind("<Right>", self._on_grid_right)
 
         self.search_clear_btn = tk.Label(
             wrap, text="✕", font=("Segoe UI", 9), fg=colors["text_muted"], bg=colors["surface"],
@@ -613,28 +616,6 @@ class AccesosDirectosApp:
                 max(0, tile_bottom + TILE_GAP - canvas_height) / scroll_height
             )
 
-    def _on_search_enter(self, _event=None) -> str:
-        """Intro en el buscador: abre el resultado resaltado (el primero
-        por defecto) sin necesidad de tocar el ratón."""
-        items = self._visible_items()
-        if not items:
-            return "break"
-        target = self._selected_visible_item() or items[0]
-        self.open_item(target)
-        return "break"
-
-    def _on_search_down(self, _event=None) -> str:
-        """Flecha abajo en el buscador: baja el foco a la cuadrícula de
-        resultados, donde ya se puede navegar con las flechas."""
-        items = self._visible_items()
-        if not items:
-            return "break"
-        current = self._selected_visible_item()
-        if current is None:
-            self._select_item_id(items[0]["id"])
-        self.root.focus_set()
-        return "break"
-
     def _tile_rows(self) -> list[list[dict]]:
         """Agrupa los elementos visibles en filas, en el mismo orden en
         que _layout_tiles los coloca, para poder mover la selección hacia
@@ -657,13 +638,7 @@ class AccesosDirectosApp:
             rows.append(current_row)
         return rows
 
-    def _focus_is_text_entry(self) -> bool:
-        focus = self.root.focus_get()
-        return isinstance(focus, (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox))
-
-    def _on_grid_left(self, _event=None) -> str | None:
-        if self._focus_is_text_entry():
-            return None
+    def _on_grid_left(self, _event=None) -> str:
         items = self._visible_items()
         if not items:
             return "break"
@@ -673,9 +648,7 @@ class AccesosDirectosApp:
         self._select_item_id(ids[max(0, idx - 1)])
         return "break"
 
-    def _on_grid_right(self, _event=None) -> str | None:
-        if self._focus_is_text_entry():
-            return None
+    def _on_grid_right(self, _event=None) -> str:
         items = self._visible_items()
         if not items:
             return "break"
@@ -685,9 +658,9 @@ class AccesosDirectosApp:
         self._select_item_id(ids[min(len(ids) - 1, idx + 1)])
         return "break"
 
-    def _on_grid_down(self, _event=None) -> str | None:
-        if self._focus_is_text_entry():
-            return None
+    def _on_grid_down(self, _event=None) -> str:
+        # Solo tiene efecto si hay más de una fila (cuadrícula
+        # "responsiva"); con una sola fila no hay a dónde bajar.
         rows = self._tile_rows()
         if not rows:
             return "break"
@@ -706,9 +679,7 @@ class AccesosDirectosApp:
         self._select_item_id(rows[0][0]["id"])
         return "break"
 
-    def _on_grid_up(self, _event=None) -> str | None:
-        if self._focus_is_text_entry():
-            return None
+    def _on_grid_up(self, _event=None) -> str:
         rows = self._tile_rows()
         if not rows:
             return "break"
@@ -719,23 +690,22 @@ class AccesosDirectosApp:
         for row_idx, row in enumerate(rows):
             for col_idx, item in enumerate(row):
                 if item["id"] == current["id"]:
-                    if row_idx == 0:
-                        # Ya estamos en la primera fila: volvemos el foco
-                        # al buscador, como haría cualquier lista con
-                        # cabecera de búsqueda.
-                        self.search_entry.focus_set()
-                        self.search_entry.icursor("end")
-                    else:
+                    if row_idx > 0:
                         prev_row = rows[row_idx - 1]
                         target = prev_row[min(col_idx, len(prev_row) - 1)]
                         self._select_item_id(target["id"])
+                    elif self.root.focus_get() is not self.search_entry:
+                        # Ya estamos en la primera fila y no veníamos del
+                        # buscador (navegación con el foco en la ventana):
+                        # subimos el foco al buscador, como en cualquier
+                        # lista con cabecera de búsqueda.
+                        self.search_entry.focus_set()
+                        self.search_entry.icursor("end")
                     return "break"
         self._select_item_id(rows[0][0]["id"])
         return "break"
 
-    def _on_grid_return(self, _event=None) -> str | None:
-        if self._focus_is_text_entry():
-            return None
+    def _on_grid_return(self, _event=None) -> str:
         items = self._visible_items()
         if not items:
             return "break"

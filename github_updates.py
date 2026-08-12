@@ -23,6 +23,26 @@ from app_config import APP_DIR, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, VERSION
 # las tarjetas (ver AccesosDirectosApp.__init__ en main.py).
 WARM_RESTART_FLAG = "--warm-restart"
 
+# Variables de entorno que el bootloader de PyInstaller usa internamente
+# para el .exe empaquetado en modo "onefile" (apuntan a la carpeta
+# temporal _MEIxxxxxx donde se descomprimió Python/Tcl/Tk para ESTA
+# ejecución). Si se heredan al lanzar una segunda instancia del propio
+# .exe, la nueva copia intenta reutilizar esa carpeta temporal en vez de
+# crear la suya propia — y en cuanto la primera instancia termina y
+# PyInstaller la borra, la segunda falla con errores como "Can't find a
+# usable init.tcl" o "Failed to load Tcl/Tk". Hay que quitarlas del
+# entorno antes de lanzar la nueva instancia (es el propio PyInstaller
+# quien documenta este problema).
+_PYINSTALLER_LEAK_VARS = ("_MEIPASS2", "TCL_LIBRARY", "TK_LIBRARY")
+
+
+def _relaunch_env() -> dict:
+    env = os.environ.copy()
+    for name in _PYINSTALLER_LEAK_VARS:
+        env.pop(name, None)
+    return env
+
+
 UPDATE_FILES = (
     "main.py",
     "iniciar.bat",
@@ -221,7 +241,7 @@ def restart_app(root=None) -> None:
     `_close_window`).
     """
     if getattr(sys, "frozen", False):
-        subprocess.Popen([sys.executable, WARM_RESTART_FLAG])
+        subprocess.Popen([sys.executable, WARM_RESTART_FLAG], env=_relaunch_env())
         _close_window(root)
         sys.exit(0)
     else:
@@ -260,6 +280,15 @@ def restart_with_update(root=None) -> None:
         "setlocal\n"
         f'set "CURRENT={current_exe}"\n'
         f'set "NEW={new_exe}"\n'
+        # Quitamos las variables que el bootloader de PyInstaller deja
+        # apuntando a la carpeta temporal de ESTA ejecución (ver
+        # _PYINSTALLER_LEAK_VARS más arriba): si el .exe que arrancamos
+        # abajo las hereda, intenta reutilizar esa carpeta temporal en
+        # vez de crear la suya, y falla con "Can't find a usable
+        # init.tcl" en cuanto esta instancia termina y la borra.
+        "set \"_MEIPASS2=\"\n"
+        "set \"TCL_LIBRARY=\"\n"
+        "set \"TK_LIBRARY=\"\n"
         "timeout /t 2 /nobreak >nul\n"
         ":esperar_liberacion\n"
         'del "%CURRENT%" 2>nul\n'
