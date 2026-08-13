@@ -40,14 +40,11 @@ from app_config import (
     get_app_version,
     get_theme,
     import_shortcuts,
-    is_startup_enabled,
     load_settings,
     load_shortcuts,
     new_item_id,
     save_settings,
     save_shortcuts,
-    set_startup_enabled,
-    startup_supported,
 )
 from github_updates import (
     WARM_RESTART_FLAG,
@@ -85,6 +82,15 @@ DRAG_THRESHOLD = 6
 # Ventana de tiempo (ms) para considerar dos clics como un doble clic.
 DOUBLE_CLICK_MS = 420
 TILE_GAP = 10
+
+# Modos de orden disponibles para las tarjetas de cada carpeta (aparte del
+# orden manual por arrastrar y soltar).
+SORT_OPTIONS = (
+    ("manual", "Orden manual"),
+    ("name_asc", "Nombre (A-Z)"),
+    ("name_desc", "Nombre (Z-A)"),
+    ("folders_first", "Carpetas primero"),
+)
 
 
 def open_path(path: str) -> None:
@@ -127,8 +133,19 @@ class Tile(tk.Frame):
         text_color = _readable_text_color(custom_color) if custom_color else colors["text"]
         muted_color = text_color if custom_color else colors["text_muted"]
 
+        self.is_broken = (
+            item["type"] == "shortcut"
+            and bool(item.get("path"))
+            and not Path(item["path"]).expanduser().exists()
+        )
+
         self.selected = item["id"] in app.selected_ids
-        border_color = colors["accent"] if self.selected else bg
+        if self.selected:
+            border_color = colors["accent"]
+        elif self.is_broken:
+            border_color = colors["danger"]
+        else:
+            border_color = bg
         border_thickness = 3 if self.selected else 2
 
         super().__init__(master, bg=bg, highlightthickness=border_thickness, highlightbackground=border_color)
@@ -143,7 +160,7 @@ class Tile(tk.Frame):
 
         self._icon_photo = None  # referencia viva: evita que Tk la recolecte
         icon_photo = None
-        if item["type"] == "shortcut":
+        if item["type"] == "shortcut" and not self.is_broken:
             icon_size = ICON_PIXEL_SIZES.get(item.get("size", DEFAULT_SIZE), 32)
             icon_photo = win_icons.get_icon_photo(item.get("path", ""), icon_size)
 
@@ -151,7 +168,10 @@ class Tile(tk.Frame):
             self._icon_photo = icon_photo
             tk.Label(self, image=icon_photo, bg=bg).pack(pady=(14, 2))
         else:
-            icon = "📁" if item["type"] == "folder" else "📄"
+            if self.is_broken:
+                icon = "⚠️"
+            else:
+                icon = "📁" if item["type"] == "folder" else "📄"
             tk.Label(
                 self, text=icon, font=("Segoe UI Emoji", 18), fg=text_color, bg=bg
             ).pack(pady=(14, 2))
@@ -196,6 +216,8 @@ class Tile(tk.Frame):
                 1 for it in self.app.shortcuts if it["parent_id"] == self.item["id"]
             )
             return f"{count} elemento" + ("" if count == 1 else "s")
+        if self.is_broken:
+            return "⚠ No se encuentra el archivo"
         return self.app.short_path(self.item.get("path", ""))
 
     def set_drop_highlight(self, on: bool) -> None:
@@ -265,6 +287,7 @@ class AccesosDirectosApp:
         self.settings = load_settings()
         self.colors = get_theme(self.settings.get("theme"))
         self.shortcuts = load_shortcuts()
+        self.sort_mode = self.settings.get("sort_mode", "manual")
 
         self.current_folder_id: str | None = None
         self.breadcrumb: list[tuple[str, str | None]] = [("Inicio", None)]
@@ -374,6 +397,7 @@ class AccesosDirectosApp:
         ).pack(side="left")
 
         self._build_search_box(toolbar)
+        self._build_sort_button(toolbar)
 
         hint_text = (
             "Arrastra sobre una carpeta o sobre la ruta de arriba para mover. "
@@ -519,6 +543,46 @@ class AccesosDirectosApp:
         self._add_tooltip(
             self.search_entry, "Buscar accesos directos (o simplemente empieza a escribir)"
         )
+
+    def _build_sort_button(self, parent: tk.Widget) -> None:
+        colors = self.colors
+        self.sort_button = tk.Label(
+            parent,
+            text=self._sort_button_text(),
+            font=("Segoe UI", 9),
+            fg=colors["text"],
+            bg=colors["surface"],
+            cursor="hand2",
+            padx=10,
+            pady=6,
+        )
+        self.sort_button.pack(side="left", padx=(10, 0))
+        self.sort_button.bind("<Button-1>", self._show_sort_menu)
+        self._add_tooltip(self.sort_button, "Cambiar el orden de las tarjetas")
+
+    def _sort_label(self, mode: str) -> str:
+        return dict(SORT_OPTIONS).get(mode, "Orden manual")
+
+    def _sort_button_text(self) -> str:
+        return f"⇅ {self._sort_label(self.sort_mode)}"
+
+    def _show_sort_menu(self, _event=None) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        for key, label in SORT_OPTIONS:
+            mark = "●  " if key == self.sort_mode else "    "
+            menu.add_command(label=mark + label, command=lambda k=key: self._set_sort_mode(k))
+        x = self.sort_button.winfo_rootx()
+        y = self.sort_button.winfo_rooty() + self.sort_button.winfo_height()
+        menu.tk_popup(x, y)
+
+    def _set_sort_mode(self, mode: str) -> None:
+        if mode == self.sort_mode:
+            return
+        self.sort_mode = mode
+        self.settings["sort_mode"] = mode
+        save_settings(self.settings)
+        self.sort_button.configure(text=self._sort_button_text())
+        self._layout_tiles()
 
     def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
         colors = self.colors
@@ -760,6 +824,34 @@ class AccesosDirectosApp:
     def _on_drop_leave(self, _event) -> None:
         self.canvas.configure(highlightthickness=0)
 
+    def _normalize_path(self, path: str) -> str:
+        try:
+            return str(Path(path).expanduser().resolve()).lower()
+        except Exception:
+            return str(path).strip().lower()
+
+    def _find_duplicate_shortcut(self, path: str, parent_id: str | None) -> dict | None:
+        """Busca si ya existe un acceso a esta misma ruta dentro de la
+        MISMA carpeta (no en toda la app: el mismo archivo puede tener un
+        acceso en el escritorio principal y otro dentro de una carpeta sin
+        que eso sea un duplicado)."""
+        norm = self._normalize_path(path)
+        for it in self.shortcuts:
+            if (
+                it["type"] == "shortcut"
+                and it["parent_id"] == parent_id
+                and self._normalize_path(it.get("path", "")) == norm
+            ):
+                return it
+        return None
+
+    def _confirm_overwrite_duplicate(self, existing: dict) -> bool:
+        return messagebox.askyesno(
+            "Acceso ya creado",
+            f'Ya existe un acceso a esta ruta en esta carpeta ("{existing["name"]}").\n\n'
+            "¿Quieres sobrescribirlo?",
+        )
+
     def _on_files_dropped(self, event) -> None:
         self._on_drop_leave(event)
         if self._is_searching():
@@ -773,11 +865,21 @@ class AccesosDirectosApp:
         siblings = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
         next_order = len(siblings)
         added = 0
+        updated = 0
 
         for raw_path in paths:
             candidate = Path(raw_path)
             if not candidate.exists():
                 continue
+
+            existing = self._find_duplicate_shortcut(str(candidate), self.current_folder_id)
+            if existing is not None:
+                if not self._confirm_overwrite_duplicate(existing):
+                    continue
+                existing["path"] = str(candidate)
+                updated += 1
+                continue
+
             self.shortcuts.append(
                 {
                     "id": new_item_id(),
@@ -793,7 +895,7 @@ class AccesosDirectosApp:
             next_order += 1
             added += 1
 
-        if added:
+        if added or updated:
             save_shortcuts(self.shortcuts)
             self._layout_tiles()
 
@@ -903,8 +1005,18 @@ class AccesosDirectosApp:
             return matches
 
         items = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
-        items.sort(key=lambda it: it.get("order", 0))
-        return items
+        return self._sort_items(items)
+
+    def _sort_items(self, items: list[dict]) -> list[dict]:
+        mode = getattr(self, "sort_mode", "manual")
+        if mode == "name_asc":
+            return sorted(items, key=lambda it: it["name"].lower())
+        if mode == "name_desc":
+            return sorted(items, key=lambda it: it["name"].lower(), reverse=True)
+        if mode == "folders_first":
+            return sorted(items, key=lambda it: (it["type"] != "folder", it["name"].lower()))
+        # "manual": el orden que se guarda al arrastrar y soltar.
+        return sorted(items, key=lambda it: it.get("order", 0))
 
     def _is_searching(self) -> bool:
         return bool(self.search_var.get().strip()) if hasattr(self, "search_var") else False
@@ -1024,8 +1136,12 @@ class AccesosDirectosApp:
             return
         try:
             open_path(item["path"])
-        except FileNotFoundError as exc:
-            messagebox.showerror("Archivo no encontrado", str(exc))
+        except FileNotFoundError:
+            if messagebox.askyesno(
+                "Archivo no encontrado",
+                f'No se encuentra "{item["path"]}".\n\n¿Quieres indicar su nueva ubicación ahora?',
+            ):
+                self._repair_shortcut_path(item)
         except OSError as exc:
             messagebox.showerror("Error al abrir", str(exc))
 
@@ -1265,6 +1381,11 @@ class AccesosDirectosApp:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Abrir", command=lambda: self.open_item(item))
 
+        if tile.is_broken:
+            menu.add_command(
+                label="⚠ Reparar ruta...", command=lambda: self._repair_shortcut_path(item)
+            )
+
         size_menu = tk.Menu(menu, tearoff=0)
         for key, preset in SIZE_PRESETS.items():
             size_menu.add_command(
@@ -1497,7 +1618,43 @@ class AccesosDirectosApp:
             return
         self._finish_add_shortcut(path)
 
+    def _repair_shortcut_path(self, item: dict) -> None:
+        """Deja elegir la nueva ubicación de un acceso cuya ruta original
+        ya no existe (se movió, se renombró o se borró y se volvió a
+        crear en otro sitio)."""
+        old_path = Path(item.get("path", ""))
+        initial_dir = str(old_path.parent) if old_path.parent.exists() else str(Path.home())
+        # No guardamos si el acceso original era a un archivo o a una
+        # carpeta, así que lo intuimos: si no tenía extensión, lo más
+        # probable es que fuera una carpeta.
+        if old_path.suffix:
+            new_path = filedialog.askopenfilename(
+                title="Selecciona la nueva ubicación del archivo", initialdir=initial_dir
+            )
+        else:
+            new_path = filedialog.askdirectory(
+                title="Selecciona la nueva ubicación de la carpeta", initialdir=initial_dir
+            )
+        if not new_path:
+            return
+        item["path"] = new_path
+        save_shortcuts(self.shortcuts)
+        self._layout_tiles()
+
     def _finish_add_shortcut(self, path: str) -> None:
+        existing = self._find_duplicate_shortcut(path, self.current_folder_id)
+        if existing is not None:
+            if not self._confirm_overwrite_duplicate(existing):
+                return
+            name = self._prompt_name(existing["name"], title="Nombre del acceso")
+            if not name:
+                return
+            existing["name"] = name
+            existing["path"] = path
+            save_shortcuts(self.shortcuts)
+            self._layout_tiles()
+            return
+
         name = self._prompt_name(Path(path).name, title="Nombre del acceso")
         if not name:
             return
@@ -1634,33 +1791,12 @@ class AccesosDirectosApp:
     # Configuración (clic y tema)
     # ------------------------------------------------------------------
 
-    def _apply_theme_live(self, theme_key: str) -> None:
-        """Aplica un tema nuevo reconstruyendo la interfaz en el mismo
-        proceso, sin reiniciar la app.
-
-        Antes esto se hacía relanzando el .exe (cerrar y abrir una nueva
-        instancia). Con el .exe empaquetado con PyInstaller ("onefile")
-        eso obliga a autoextraerse de nuevo en una carpeta temporal, justo
-        el momento en que el antivirus suele intervenir y a veces provoca
-        errores como "Failed to load Python DLL" o "Can't find a usable
-        init.tcl". Reconstruir la interfaz aquí mismo evita ese problema
-        por completo y además es instantáneo para quien lo usa.
-        """
-        self.colors = get_theme(theme_key)
-        self.root.configure(bg=self.colors["bg"])
-        for widget in self.root.winfo_children():
-            widget.destroy()
-        self._tile_by_id = {}
-        self._build_ui()
-        self.root.update_idletasks()
-        self._layout_tiles()
-
     def open_settings_dialog(self) -> None:
         colors = self.colors
         dialog = tk.Toplevel(self.root)
         dialog.title("Configuración")
         dialog.configure(bg=colors["bg"])
-        dialog.geometry("360x420" if startup_supported() else "360x300")
+        dialog.geometry("360x300")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1692,34 +1828,21 @@ class AccesosDirectosApp:
                 highlightthickness=0,
             ).pack(anchor="w", padx=26)
 
-        startup_var = tk.BooleanVar(value=is_startup_enabled())
-        if startup_supported():
-            tk.Label(
-                dialog, text="Inicio con Windows", font=("Segoe UI", 10, "bold"),
-                fg=colors["text"], bg=colors["bg"],
-            ).pack(anchor="w", padx=18, pady=(16, 4))
-            tk.Checkbutton(
-                dialog, text="Abrir la app al iniciar sesión en Windows", variable=startup_var,
-                fg=colors["text"], bg=colors["bg"], selectcolor=colors["surface"],
-                activebackground=colors["bg"], activeforeground=colors["text"],
-                highlightthickness=0,
-            ).pack(anchor="w", padx=26)
+        tk.Label(
+            dialog, text="El tema se aplica al reiniciar la app.", font=("Segoe UI", 8),
+            fg=colors["text_muted"], bg=colors["bg"],
+        ).pack(anchor="w", padx=18, pady=(6, 0))
 
         def save_and_close() -> None:
             self.settings["click_mode"] = click_var.get()
             theme_changed = theme_var.get() != self.settings.get("theme")
             self.settings["theme"] = theme_var.get()
             save_settings(self.settings)
-            if startup_supported():
-                try:
-                    set_startup_enabled(startup_var.get())
-                except OSError as exc:
-                    messagebox.showerror(
-                        "Error", f"No se pudo cambiar el inicio con Windows:\n{exc}"
-                    )
             dialog.destroy()
-            if theme_changed:
-                self._apply_theme_live(self.settings["theme"])
+            if theme_changed and messagebox.askyesno(
+                "Reiniciar", "El tema ha cambiado. ¿Reiniciar ahora para aplicarlo?"
+            ):
+                restart_app(self.root)
 
         buttons = tk.Frame(dialog, bg=colors["bg"], pady=14)
         buttons.pack(fill="x", padx=18)

@@ -86,69 +86,14 @@ SIZE_PRESETS = {
 }
 DEFAULT_SIZE = "medium"
 
+SORT_MODES = ("manual", "name_asc", "name_desc", "folders_first")
+
 DEFAULT_SETTINGS = {
     "auto_check_updates": True,
     "click_mode": "double",  # "single" o "double"
     "theme": DEFAULT_THEME,
+    "sort_mode": "manual",  # "manual" | "name_asc" | "name_desc" | "folders_first"
 }
-
-# ---------------------------------------------------------------------------
-# Arranque automático con Windows (pestaña "Aplicaciones de inicio" del
-# Administrador de tareas). Se guarda en el registro, no en settings.json,
-# para que sea siempre el propio Windows quien tenga la última palabra
-# sobre si está activo (por ejemplo si el usuario lo desactiva a mano
-# desde el Administrador de tareas, la app lo detecta correctamente).
-# ---------------------------------------------------------------------------
-
-STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-STARTUP_VALUE_NAME = "AccesosDirectos"
-
-
-def _startup_command() -> str:
-    if getattr(sys, "frozen", False):
-        exe = Path(sys.executable).resolve()
-        return f'"{exe}"'
-    # Modo fuente (sin compilar): usa pythonw.exe para que no abra una
-    # consola al arrancar con Windows.
-    python_dir = Path(sys.executable).resolve().parent
-    pythonw = python_dir / "pythonw.exe"
-    interpreter = pythonw if pythonw.exists() else Path(sys.executable).resolve()
-    script = (APP_DIR / "main.py").resolve()
-    return f'"{interpreter}" "{script}"'
-
-
-def startup_supported() -> bool:
-    return sys.platform == "win32"
-
-
-def is_startup_enabled() -> bool:
-    if not startup_supported():
-        return False
-    import winreg
-
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY) as key:
-            value, _ = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
-            return bool(value)
-    except OSError:
-        return False
-
-
-def set_startup_enabled(enabled: bool) -> None:
-    if not startup_supported():
-        return
-    import winreg
-
-    with winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
-    ) as key:
-        if enabled:
-            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
-        else:
-            try:
-                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
-            except FileNotFoundError:
-                pass
 
 DEFAULT_SHORTCUTS = [
     {"name": "Documentos", "path": str(Path.home() / "Documents")},
@@ -202,6 +147,8 @@ def load_settings() -> dict:
     merged["click_mode"] = click_mode if click_mode in ("single", "double") else "double"
     theme = data.get("theme", DEFAULT_SETTINGS["theme"])
     merged["theme"] = theme if theme in THEMES else DEFAULT_THEME
+    sort_mode = data.get("sort_mode", DEFAULT_SETTINGS["sort_mode"])
+    merged["sort_mode"] = sort_mode if sort_mode in SORT_MODES else "manual"
     return merged
 
 
