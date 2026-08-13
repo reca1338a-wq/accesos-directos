@@ -119,21 +119,27 @@ def check_for_updates(owner: str = "", repo: str = "", token: str = "") -> Updat
         return None
 
     frozen = getattr(sys, "frozen", False)
-    wanted_suffix = ".exe" if frozen else ".zip"
     download_url = ""
-    for asset in release.get("assets", []):
-        if asset.get("name", "").lower().endswith(wanted_suffix):
-            download_url = asset.get("browser_download_url", "")
-            break
 
-    if not download_url and not frozen:
+    if frozen:
+        # La app compilada (onedir) se publica como un .zip de la carpeta
+        # entera, no un único .exe: ver el paso "Empaquetar" del workflow
+        # de GitHub Actions.
+        for asset in release.get("assets", []):
+            if asset.get("name", "").lower().endswith(".zip"):
+                download_url = asset.get("browser_download_url", "")
+                break
+        if not download_url:
+            raise UpdateError(
+                "No se encontró en la release un .zip de la app compilada. "
+                "Revisa que el workflow de GitHub Actions haya subido ese archivo."
+            )
+    else:
+        # En modo fuente usamos siempre el zip automático del código
+        # fuente que genera GitHub para cada release/tag.
         download_url = release.get("zipball_url", "")
-
-    if not download_url:
-        raise UpdateError(
-            "No se encontró en la release un archivo compatible "
-            f"({wanted_suffix}). Revisa que hayas subido ese tipo de archivo al Release."
-        )
+        if not download_url:
+            raise UpdateError("La release no tiene un zip de código fuente disponible.")
 
     return UpdateInfo(
         current_version=current,
@@ -146,25 +152,25 @@ def check_for_updates(owner: str = "", repo: str = "", token: str = "") -> Updat
 def cleanup_stale_update_files() -> None:
     """Borra restos de una actualización anterior (por si algo quedó a medias).
 
-    Se llama al arrancar la app: si estamos corriendo como el .exe actual,
-    cualquier *_nuevo.exe o _actualizar.bat que siga junto a él es basura
-    de una actualización ya aplicada (o interrumpida) y se puede eliminar
-    con seguridad.
+    Se llama al arrancar la app: si estamos corriendo con normalidad,
+    cualquier carpeta de preparación o script de actualización que siga
+    por ahí es basura de una actualización ya aplicada (o interrumpida) y
+    se puede eliminar con seguridad.
     """
     if not getattr(sys, "frozen", False):
         return
 
-    current_exe = Path(sys.executable).resolve()
-    candidates = (
-        current_exe.with_name(current_exe.stem + "_nuevo.exe"),
-        current_exe.with_name("_actualizar.bat"),
-    )
-    for stale in candidates:
-        if stale.exists():
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+    app_dir = Path(sys.executable).resolve().parent
+    staging_dir = app_dir.parent / f"{app_dir.name}_actualizacion"
+    updater_bat = app_dir.parent / "_actualizar.bat"
+
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    if updater_bat.exists():
+        try:
+            updater_bat.unlink()
+        except OSError:
+            pass
 
 
 def apply_update(download_url: str, token: str = "", latest_version: str = "") -> None:
@@ -180,45 +186,52 @@ def apply_update(download_url: str, token: str = "", latest_version: str = "") -
 # ---------------------------------------------------------------------------
 
 def _apply_update_exe(download_url: str, token: str = "", latest_version: str = "") -> None:
-    """Descarga el nuevo .exe junto al actual, listo para sustituirlo al reiniciar."""
+    """Descarga el .zip de la nueva versión (app completa, modo onedir) y
+    lo deja ya descomprimido en una carpeta de preparación, lista para
+    aplicarse al reiniciar (ver `restart_with_update`)."""
     headers = {"User-Agent": "AccesosDirectos-Updater"}
     if token.strip():
         headers["Authorization"] = f"Bearer {token.strip()}"
 
     request = urllib.request.Request(download_url, headers=headers)
-    current_exe = Path(sys.executable).resolve()
-    new_exe = current_exe.with_name(current_exe.stem + "_nuevo.exe")
+    app_dir = Path(sys.executable).resolve().parent
+    staging_dir = app_dir.parent / f"{app_dir.name}_actualizacion"
+    zip_path = Path(tempfile.gettempdir()) / "accesos-directos-actualizacion.zip"
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, new_exe.open("wb") as handle:
-            expected_size = response.getheader("Content-Length")
+        with urllib.request.urlopen(request, timeout=120) as response, zip_path.open("wb") as handle:
             shutil.copyfileobj(response, handle)
+
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(staging_dir)
     except Exception as exc:
-        new_exe.unlink(missing_ok=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise UpdateError(f"No se pudo descargar la actualización: {exc}") from exc
+    finally:
+        zip_path.unlink(missing_ok=True)
 
-    # Una descarga cortada a medias (conexión inestable) deja un .exe
-    # incompleto que arranca pero falla al autoextraerse con errores como
-    # "Failed to load Python DLL". Comprobar el tamaño contra el que
-    # anunció GitHub evita instalar un ejecutable roto.
-    actual_size = new_exe.stat().st_size
-    if expected_size and actual_size != int(expected_size):
-        new_exe.unlink(missing_ok=True)
-        raise UpdateError(
-            "La descarga de la actualización se interrumpió a medias "
-            f"({actual_size} de {expected_size} bytes). Vuelve a intentarlo."
-        )
-    if actual_size < 1_000_000:  # un .exe con Python+Tk embebido nunca pesa tan poco
-        new_exe.unlink(missing_ok=True)
-        raise UpdateError("El archivo descargado no parece un ejecutable válido. Vuelve a intentarlo.")
+    # Si el zip trae todo metido dentro de una única carpeta contenedora
+    # (según cómo se haya comprimido), usamos su contenido directamente.
+    children = list(staging_dir.iterdir())
+    if len(children) == 1 and children[0].is_dir():
+        inner = children[0]
+        for item in inner.iterdir():
+            shutil.move(str(item), str(staging_dir / item.name))
+        inner.rmdir()
 
-    # Actualizamos ya el número de versión mostrado, aunque el .exe se
-    # sustituya realmente al reiniciar.
+    # Actualizamos ya el número de versión mostrado, aunque el cambio
+    # real de archivos ocurra al reiniciar.
     if latest_version:
-        try:
-            VERSION_FILE.write_text(latest_version.lstrip("vV") + "\n", encoding="utf-8")
-        except OSError:
-            pass
+        version_text = latest_version.lstrip("vV") + "\n"
+        for target in (staging_dir / "VERSION", VERSION_FILE):
+            try:
+                target.write_text(version_text, encoding="utf-8")
+            except OSError:
+                pass
 
 
 def _close_window(root) -> None:
@@ -266,68 +279,48 @@ def restart_app(root=None) -> None:
 
 
 def restart_with_update(root=None) -> None:
-    """Sustituye el .exe actual por el descargado (si lo hay) y reinicia la app."""
+    """Aplica la actualización ya descargada (ver `_apply_update_exe`) y
+    reinicia la app."""
     if not getattr(sys, "frozen", False):
         restart_app(root)
         return
 
     current_exe = Path(sys.executable).resolve()
-    new_exe = current_exe.with_name(current_exe.stem + "_nuevo.exe")
+    app_dir = current_exe.parent
+    staging_dir = app_dir.parent / f"{app_dir.name}_actualizacion"
 
-    if not new_exe.exists():
+    if not staging_dir.exists():
         # No hay actualización pendiente, reinicio normal.
         restart_app(root)
         return
 
-    # En Windows no se puede sobrescribir un .exe mientras se está ejecutando,
-    # así que dejamos un script que espera a que cerremos, hace el cambio y
-    # vuelve a abrir la app.
-    #
-    # Reintenta el borrado y el movido en bucle en vez de esperar un tiempo
-    # fijo: el proceso anterior o el antivirus (que escanea el .exe recién
-    # descargado) pueden tardar un instante variable en soltar el archivo.
-    # Confirmar cada paso antes de continuar evita el error
-    # "Failed to load Python DLL" al abrir el ejecutable a medio mover, y
-    # el "if exist %NEW% del" final evita que quede un *_nuevo.exe huérfano
-    # si algo se retrasa más de lo normal.
-    updater = current_exe.with_name("_actualizar.bat")
+    # Sincronizamos la carpeta de preparación sobre la carpeta real de la
+    # app con robocopy (incluido en Windows) en vez de un bucle de
+    # borrado/movido hecho a mano: robocopy ya trae reintentos
+    # incorporados pensados exactamente para esto (archivos que un
+    # antivirus o el propio proceso anterior aún tienen bloqueados un
+    # instante), así que es mucho más fiable.
+    updater = app_dir.parent / "_actualizar.bat"
     updater.write_text(
         "@echo off\n"
         "setlocal\n"
-        f'set "CURRENT={current_exe}"\n'
-        f'set "NEW={new_exe}"\n'
-        # Quitamos las variables que el bootloader de PyInstaller deja
-        # apuntando a la carpeta temporal de ESTA ejecución (ver
-        # _PYINSTALLER_LEAK_VARS más arriba): si el .exe que arrancamos
-        # abajo las hereda, intenta reutilizar esa carpeta temporal en
-        # vez de crear la suya, y falla con "Can't find a usable
-        # init.tcl" en cuanto esta instancia termina y la borra.
+        f'set "APPDIR={app_dir}"\n'
+        f'set "STAGING={staging_dir}"\n'
+        f'set "EXE={current_exe}"\n'
+        # Quitamos las variables que el bootloader de PyInstaller pueda
+        # dejar en el entorno (ver _PYINSTALLER_LEAK_VARS más arriba).
         "set \"_MEIPASS2=\"\n"
         "set \"TCL_LIBRARY=\"\n"
         "set \"TK_LIBRARY=\"\n"
         "timeout /t 2 /nobreak >nul\n"
-        ":esperar_liberacion\n"
-        'del "%CURRENT%" 2>nul\n'
-        'if exist "%CURRENT%" (\n'
-        "  timeout /t 1 /nobreak >nul\n"
-        "  goto esperar_liberacion\n"
-        ")\n"
-        ":mover\n"
-        'move /y "%NEW%" "%CURRENT%" >nul 2>nul\n'
-        'if not exist "%CURRENT%" (\n'
-        "  timeout /t 1 /nobreak >nul\n"
-        "  goto mover\n"
-        ")\n"
-        'if exist "%NEW%" del /f /q "%NEW%"\n'
-        # Espera algo más antes de arrancar el .exe recién movido: el
-        # antivirus (Windows Defender incluido) suele analizar en segundo
-        # plano cualquier .exe nuevo o recién movido nada más aparecer, y
-        # si lo lanzamos mientras aún lo tiene abierto para escanearlo, el
-        # autoextraíble de PyInstaller puede fallar a mitad ("Failed to
-        # load Python DLL", "Can't find a usable init.tcl"). Este margen
-        # no lo evita al 100%, pero reduce mucho la probabilidad.
-        "timeout /t 3 /nobreak >nul\n"
-        f'start "" "%CURRENT%" {WARM_RESTART_FLAG}\n'
+        # /E copia subcarpetas (incluidas vacías); /IS/IT también
+        # sobrescribe archivos idénticos o "solo con la fecha distinta"
+        # (por si acaso); /R:20 /W:1 reintenta hasta 20 veces esperando
+        # 1s si algo sigue bloqueado, en vez de rendirse a la primera.
+        'robocopy "%STAGING%" "%APPDIR%" /E /IS /IT /R:20 /W:1 /NFL /NDL /NJH /NJS\n'
+        'rmdir /s /q "%STAGING%" 2>nul\n'
+        "timeout /t 1 /nobreak >nul\n"
+        f'start "" "%EXE%" {WARM_RESTART_FLAG}\n'
         'del "%~f0"\n',
         encoding="utf-8",
     )

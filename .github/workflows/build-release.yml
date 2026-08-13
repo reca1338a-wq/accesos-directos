@@ -1,4 +1,4 @@
-name: Compilar y publicar el .exe
+name: Compilar y publicar la app
 
 # Se ejecuta automáticamente cuando subes un tag de versión (ej. 2.1.1 o
 # v2.1.1, ambos valen), y también se puede lanzar a mano desde la pestaña
@@ -34,8 +34,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Compilar el .exe
+      - name: Compilar la app (modo onedir)
         run: pyinstaller main.spec
+
+      - name: Asegurar VERSION junto al ejecutable
+        shell: pwsh
+        run: Copy-Item VERSION dist/main/VERSION -Force
+
+      - name: Empaquetar la app en un .zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/main/* -DestinationPath AccesosDirectos.zip -Force
 
       - name: Leer la versión desde VERSION
         id: version
@@ -46,6 +54,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.value }}
-          files: dist/main.exe
+          files: AccesosDirectos.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
