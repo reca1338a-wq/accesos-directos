@@ -40,11 +40,14 @@ from app_config import (
     get_app_version,
     get_theme,
     import_shortcuts,
+    is_startup_enabled,
     load_settings,
     load_shortcuts,
     new_item_id,
     save_settings,
     save_shortcuts,
+    set_startup_enabled,
+    startup_supported,
 )
 from github_updates import (
     WARM_RESTART_FLAG,
@@ -1796,7 +1799,7 @@ class AccesosDirectosApp:
         dialog = tk.Toplevel(self.root)
         dialog.title("Configuración")
         dialog.configure(bg=colors["bg"])
-        dialog.geometry("360x300")
+        dialog.geometry("360x330")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1833,11 +1836,24 @@ class AccesosDirectosApp:
             fg=colors["text_muted"], bg=colors["bg"],
         ).pack(anchor="w", padx=18, pady=(6, 0))
 
+        startup_var = tk.BooleanVar(value=is_startup_enabled())
+        if startup_supported():
+            tk.Checkbutton(
+                dialog,
+                text="Arrancar automáticamente con Windows",
+                variable=startup_var,
+                fg=colors["text"], bg=colors["bg"], selectcolor=colors["surface"],
+                activebackground=colors["bg"], activeforeground=colors["text"],
+                highlightthickness=0,
+            ).pack(anchor="w", padx=18, pady=(16, 0))
+
         def save_and_close() -> None:
             self.settings["click_mode"] = click_var.get()
             theme_changed = theme_var.get() != self.settings.get("theme")
             self.settings["theme"] = theme_var.get()
             save_settings(self.settings)
+            if startup_supported():
+                set_startup_enabled(startup_var.get())
             dialog.destroy()
             if theme_changed and messagebox.askyesno(
                 "Reiniciar", "El tema ha cambiado. ¿Reiniciar ahora para aplicarlo?"
