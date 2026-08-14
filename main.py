@@ -36,6 +36,7 @@ from app_config import (
     SHORTCUTS_PATH,
     SIZE_PRESETS,
     THEMES,
+    TRASH_RETENTION_DAYS,
     USER_DATA_DIR,
     expand_path,
     export_shortcuts,
@@ -45,10 +46,13 @@ from app_config import (
     is_startup_enabled,
     load_settings,
     load_shortcuts,
+    load_trash,
     new_item_id,
     portabilize_path,
+    purge_old_trash,
     save_settings,
     save_shortcuts,
+    save_trash,
     set_startup_enabled,
     startup_supported,
 )
@@ -175,23 +179,20 @@ class Tile(tk.Frame):
             tk.Frame(self, bg=category_color, height=4).pack(fill="x", side="top")
 
         self._icon_photo = None  # referencia viva: evita que Tk la recolecte
+        self._folder_preview_photos: list = []  # referencias vivas del mosaico de carpeta
         icon_photo = None
         if item["type"] == "shortcut" and not self.is_broken:
             icon_size = ICON_PIXEL_SIZES.get(item.get("size", DEFAULT_SIZE), 32)
             icon_photo = win_icons.get_icon_photo(expand_path(item.get("path", "")), icon_size)
 
+        icon_font_size = 14 if compact else 18
+
         if compact:
             row = tk.Frame(self, bg=bg)
             row.pack(fill="both", expand=True, padx=8, pady=4)
 
-            if icon_photo is not None:
-                self._icon_photo = icon_photo
-                tk.Label(row, image=icon_photo, bg=bg).pack(side="left", padx=(0, 8))
-            else:
-                icon = "⚠️" if self.is_broken else ("📁" if item["type"] == "folder" else "📄")
-                tk.Label(
-                    row, text=icon, font=("Segoe UI Emoji", 14), fg=text_color, bg=bg
-                ).pack(side="left", padx=(0, 8))
+            icon_widget = self._build_icon_widget(row, bg, text_color, icon_photo, icon_font_size)
+            icon_widget.pack(side="left", padx=(0, 8))
 
             text_col = tk.Frame(row, bg=bg)
             text_col.pack(side="left", fill="both", expand=True)
@@ -206,17 +207,8 @@ class Tile(tk.Frame):
                     anchor="w",
                 ).pack(fill="x")
         else:
-            if icon_photo is not None:
-                self._icon_photo = icon_photo
-                tk.Label(self, image=icon_photo, bg=bg).pack(pady=(14, 2))
-            else:
-                if self.is_broken:
-                    icon = "⚠️"
-                else:
-                    icon = "📁" if item["type"] == "folder" else "📄"
-                tk.Label(
-                    self, text=icon, font=("Segoe UI Emoji", 18), fg=text_color, bg=bg
-                ).pack(pady=(14, 2))
+            icon_widget = self._build_icon_widget(self, bg, text_color, icon_photo, icon_font_size)
+            icon_widget.pack(pady=(14, 2))
 
             tk.Label(
                 self,
@@ -246,6 +238,45 @@ class Tile(tk.Frame):
             widget.bind("<ButtonRelease-1>", self._on_release)
             widget.bind("<Button-3>", self._on_right_click)
             widget.configure(cursor="hand2")
+
+    def _build_icon_widget(
+        self, parent: tk.Misc, bg: str, text_color: str, icon_photo, icon_font_size: int
+    ) -> tk.Widget:
+        """Construye el icono principal de la tarjeta. Para una carpeta con
+        contenido, es un pequeño mosaico con los iconos de hasta 3 de sus
+        elementos (al estilo del Explorador de Windows) en vez del icono
+        genérico de carpeta."""
+        if self.item["type"] == "folder":
+            children = sorted(
+                (c for c in self.app.shortcuts if c["parent_id"] == self.item["id"]),
+                key=lambda c: c.get("order", 0),
+            )[:3]
+            if children:
+                mosaic = tk.Frame(parent, bg=bg)
+                mini_size = 13 if self.compact else 20
+                for child in children:
+                    mini_photo = None
+                    if child["type"] == "shortcut":
+                        mini_photo = win_icons.get_icon_photo(
+                            expand_path(child.get("path", "")), mini_size
+                        )
+                    if mini_photo is not None:
+                        self._folder_preview_photos.append(mini_photo)
+                        tk.Label(mosaic, image=mini_photo, bg=bg).pack(side="left", padx=1)
+                    else:
+                        mini_icon = "📁" if child["type"] == "folder" else "📄"
+                        tk.Label(
+                            mosaic, text=mini_icon, font=("Segoe UI Emoji", mini_size - 4),
+                            fg=text_color, bg=bg,
+                        ).pack(side="left", padx=1)
+                return mosaic
+
+        if icon_photo is not None:
+            self._icon_photo = icon_photo
+            return tk.Label(parent, image=icon_photo, bg=bg)
+
+        icon = "⚠️" if self.is_broken else ("📁" if self.item["type"] == "folder" else "📄")
+        return tk.Label(parent, text=icon, font=("Segoe UI Emoji", icon_font_size), fg=text_color, bg=bg)
 
     def _all_children(self) -> list[tk.Widget]:
         widgets: list[tk.Widget] = [self]
@@ -329,16 +360,24 @@ class AccesosDirectosApp:
         self.settings = load_settings()
         self.colors = get_theme(self.settings.get("theme"))
         self.shortcuts = load_shortcuts()
+        self.trash, _purged = purge_old_trash(load_trash())
+        if _purged:
+            save_trash(self.trash)
         self.sort_mode = self.settings.get("sort_mode", "manual")
         self.card_style = self.settings.get("card_style", "cards")
         self.categories: dict[str, str] = self.settings.get("categories", {})
         self.category_filter: str | None = None
+        self.group_by_category: bool = bool(self.settings.get("group_by_category", False))
 
         self.current_folder_id: str | None = None
         self.breadcrumb: list[tuple[str, str | None]] = [("Inicio", None)]
 
         self.selected_ids: set[str] = set()
         self._selection_anchor_id: str | None = None
+        self._marquee_start: tuple[float, float] | None = None
+        self._marquee_rect_id: int | None = None
+        self._marquee_base_ids: set[str] = set()
+        self._marquee_dragging = False
 
         self._update_running = False
         self._pending_update = None
@@ -478,8 +517,12 @@ class AccesosDirectosApp:
         scrollbar.pack(side="right", fill="y")
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.canvas.bind("<Button-1>", self._on_background_click, add="+")
-        self.scrollable.bind("<Button-1>", self._on_background_click, add="+")
+        self.canvas.bind("<ButtonPress-1>", self._on_background_press, add="+")
+        self.scrollable.bind("<ButtonPress-1>", self._on_background_press, add="+")
+        self.canvas.bind("<B1-Motion>", self._on_background_drag, add="+")
+        self.scrollable.bind("<B1-Motion>", self._on_background_drag, add="+")
+        self.canvas.bind("<ButtonRelease-1>", self._on_background_release, add="+")
+        self.scrollable.bind("<ButtonRelease-1>", self._on_background_release, add="+")
         self.root.bind("<Escape>", lambda _e: self._on_escape())
 
         if _DND_AVAILABLE:
@@ -512,6 +555,8 @@ class AccesosDirectosApp:
         file_menu.add_command(label="Exportar...", command=self.export_shortcuts_dialog)
         file_menu.add_command(label="Editar lista (JSON)...", command=self.edit_config)
         file_menu.add_command(label="Recargar lista", command=self.reload)
+        file_menu.add_separator()
+        file_menu.add_command(label="🗑 Papelera...", command=self.open_trash_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="Salir", command=self.root.quit)
         menubar.add_cascade(label="Archivo", menu=file_menu)
@@ -682,6 +727,8 @@ class AccesosDirectosApp:
         self._add_tooltip(self.category_button, "Filtrar por categoría")
 
     def _category_button_text(self) -> str:
+        if self.group_by_category:
+            return "🏷 Agrupadas"
         if not self.category_filter:
             return "🏷 Todas"
         if self.category_filter == "__none__":
@@ -690,22 +737,37 @@ class AccesosDirectosApp:
 
     def _show_category_filter_menu(self, _event=None) -> None:
         menu = tk.Menu(self.root, tearoff=0)
-        mark = "●  " if not self.category_filter else "    "
+        mark = "●  " if self.group_by_category else "    "
+        menu.add_command(label=mark + "Agrupar por categoría", command=self._toggle_group_by_category)
+        menu.add_separator()
+        mark = "●  " if (not self.group_by_category and not self.category_filter) else "    "
         menu.add_command(label=mark + "Todas", command=lambda: self._set_category_filter(None))
-        mark = "●  " if self.category_filter == "__none__" else "    "
+        mark = "●  " if (not self.group_by_category and self.category_filter == "__none__") else "    "
         menu.add_command(
             label=mark + "Sin categoría", command=lambda: self._set_category_filter("__none__")
         )
         if self.categories:
             menu.add_separator()
             for name in self.categories:
-                mark = "●  " if self.category_filter == name else "    "
+                mark = "●  " if (not self.group_by_category and self.category_filter == name) else "    "
                 menu.add_command(label=mark + name, command=lambda n=name: self._set_category_filter(n))
         x = self.category_button.winfo_rootx()
         y = self.category_button.winfo_rooty() + self.category_button.winfo_height()
         menu.tk_popup(x, y)
 
+    def _toggle_group_by_category(self) -> None:
+        self.group_by_category = not self.group_by_category
+        self.settings["group_by_category"] = self.group_by_category
+        save_settings(self.settings)
+        if self.group_by_category:
+            # La agrupación ya muestra todas las categorías a la vez, así
+            # que un filtro de una sola categoría no tendría sentido aquí.
+            self.category_filter = None
+        self.category_button.configure(text=self._category_button_text())
+        self._layout_tiles()
+
     def _set_category_filter(self, value: str | None) -> None:
+        self.group_by_category = False
         self.category_filter = value
         self.category_button.configure(text=self._category_button_text())
         self._layout_tiles()
@@ -1113,15 +1175,94 @@ class AccesosDirectosApp:
         # se arrastra el borde de la ventana: mantiene la app fluida.
         self._resize_after_id = self.root.after(80, self._layout_tiles)
 
-    def _on_background_click(self, event: tk.Event) -> None:
+    def _canvas_space_xy(self, event: tk.Event) -> tuple[float, float]:
+        # Coordenadas relativas al canvas (independientemente de si el
+        # evento llegó desde self.canvas o desde self.scrollable), ya
+        # convertidas al espacio "virtual" que usa canvasx/canvasy (el
+        # mismo en el que están colocadas las tarjetas con .place).
+        vx = event.x_root - self.canvas.winfo_rootx()
+        vy = event.y_root - self.canvas.winfo_rooty()
+        return self.canvas.canvasx(vx), self.canvas.canvasy(vy)
+
+    def _position_marquee_overlay(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        off_x, off_y = self.canvas.canvasx(0), self.canvas.canvasy(0)
+        left, right = sorted((x0 - off_x, x1 - off_x))
+        top, bottom = sorted((y0 - off_y, y1 - off_y))
+        width, height = max(right - left, 1), max(bottom - top, 1)
+        thickness = 2
+        top_bar, bottom_bar, left_bar, right_bar = self._marquee_bars
+        top_bar.place(x=left, y=top, width=width, height=thickness)
+        bottom_bar.place(x=left, y=bottom - thickness, width=width, height=thickness)
+        left_bar.place(x=left, y=top, width=thickness, height=height)
+        right_bar.place(x=right - thickness, y=top, width=thickness, height=height)
+
+    def _destroy_marquee_overlay(self) -> None:
+        for bar in self._marquee_bars:
+            bar.destroy()
+        self._marquee_bars = []
+
+    def _on_background_press(self, event: tk.Event) -> None:
         # Solo cuenta como "vacío" si el clic no cayó sobre una tarjeta
         # (las tarjetas están colocadas encima con .place, pero un clic en
         # el hueco entre ellas llega hasta el frame de fondo).
         widget = self.root.winfo_containing(event.x_root, event.y_root)
         if self._find_tile_ancestor(widget) is not None:
+            self._marquee_start = None
             return
-        if self.selected_ids:
-            self._clear_selection()
+        if self._is_searching() or self.group_by_category:
+            # En modo búsqueda o agrupado por categoría el orden visual no
+            # se corresponde 1:1 con una cuadrícula simple; se deja el
+            # simple "clic para deseleccionar" en vez del recuadro.
+            self._marquee_start = None
+            if self.selected_ids:
+                self._clear_selection()
+            return
+
+        ctrl_or_shift = bool(event.state & 0x0004) or bool(event.state & 0x0001)
+        self._marquee_base_ids = set(self.selected_ids) if ctrl_or_shift else set()
+        self._marquee_start = self._canvas_space_xy(event)
+        self._marquee_dragging = False
+
+    def _on_background_drag(self, event: tk.Event) -> None:
+        if self._marquee_start is None:
+            return
+        x0, y0 = self._marquee_start
+        x1, y1 = self._canvas_space_xy(event)
+
+        if not self._marquee_dragging:
+            if abs(x1 - x0) < DRAG_THRESHOLD and abs(y1 - y0) < DRAG_THRESHOLD:
+                return
+            self._marquee_dragging = True
+            self._marquee_bars = [tk.Frame(self.canvas, bg=self.colors["accent"]) for _ in range(4)]
+
+        self._position_marquee_overlay(x0, y0, x1, y1)
+
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        hit_ids = {
+            item_id
+            for item_id, tile in self._tile_by_id.items()
+            if tile.winfo_x() < right
+            and tile.winfo_x() + tile.winfo_width() > left
+            and tile.winfo_y() < bottom
+            and tile.winfo_y() + tile.winfo_height() > top
+        }
+        new_selection = self._marquee_base_ids | hit_ids
+        if new_selection != self.selected_ids:
+            self.selected_ids = new_selection
+            self._selection_anchor_id = next(iter(hit_ids), self._selection_anchor_id)
+            self._layout_tiles()
+
+    def _on_background_release(self, _event: tk.Event) -> None:
+        if self._marquee_dragging:
+            self._destroy_marquee_overlay()
+        elif self._marquee_start is not None:
+            # No llegó a arrastrarse lo bastante para ser un recuadro: es
+            # un simple clic en el fondo, para deseleccionar.
+            if self.selected_ids:
+                self._clear_selection()
+        self._marquee_start = None
+        self._marquee_dragging = False
 
     def _visible_items(self) -> list[dict]:
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
@@ -1222,39 +1363,77 @@ class AccesosDirectosApp:
 
         self._tile_by_id = {}
 
+        if self.group_by_category and not self._is_searching():
+            y = TILE_GAP
+            for label, group_items in self._grouped_by_category(items):
+                if not group_items:
+                    continue
+                tk.Label(
+                    self.scrollable, text=label, font=("Segoe UI", 10, "bold"),
+                    fg=self.colors["text_muted"], bg=self.colors["bg"],
+                ).place(x=TILE_GAP, y=y)
+                y += 24
+                y = self._place_items(group_items, y, canvas_width, compact)
+                y += 10
+            total_height = y
+        else:
+            total_height = self._place_items(items, TILE_GAP, canvas_width, compact)
+
+        self.scrollable.configure(width=canvas_width, height=total_height)
+        self.canvas.configure(scrollregion=(0, 0, canvas_width, total_height))
+        self._render_recent_section()
+
+    def _place_items(self, items: list[dict], y0: int, canvas_width: int, compact: bool) -> int:
+        """Coloca `items` en la cuadrícula (o filas, si `compact`) a
+        partir de `y0`; devuelve el `y` justo debajo de lo colocado."""
         if compact:
             row_height = 44
-            y = TILE_GAP
+            y = y0
             row_width = max(canvas_width - 2 * TILE_GAP, 120)
             for item in items:
                 tile = Tile(self.scrollable, self, item, compact=True)
                 tile.place(x=TILE_GAP, y=y, width=row_width, height=row_height)
                 self._tile_by_id[item["id"]] = tile
                 y += row_height + TILE_GAP
-            total_height = y
-        else:
-            x = TILE_GAP
-            y = TILE_GAP
-            row_height = 0
-            for item in items:
-                preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
-                width, height = preset["width"], preset["height"]
-                if x + width + TILE_GAP > canvas_width and x > TILE_GAP:
-                    x = TILE_GAP
-                    y += row_height + TILE_GAP
-                    row_height = 0
+            return y
 
-                tile = Tile(self.scrollable, self, item)
-                tile.place(x=x, y=y, width=width, height=height)
-                self._tile_by_id[item["id"]] = tile
+        x = TILE_GAP
+        y = y0
+        row_height = 0
+        for item in items:
+            preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
+            width, height = preset["width"], preset["height"]
+            if x + width + TILE_GAP > canvas_width and x > TILE_GAP:
+                x = TILE_GAP
+                y += row_height + TILE_GAP
+                row_height = 0
 
-                x += width + TILE_GAP
-                row_height = max(row_height, height)
-            total_height = y + row_height + TILE_GAP
+            tile = Tile(self.scrollable, self, item)
+            tile.place(x=x, y=y, width=width, height=height)
+            self._tile_by_id[item["id"]] = tile
 
-        self.scrollable.configure(width=canvas_width, height=total_height)
-        self.canvas.configure(scrollregion=(0, 0, canvas_width, total_height))
-        self._render_recent_section()
+            x += width + TILE_GAP
+            row_height = max(row_height, height)
+        return y + row_height + TILE_GAP
+
+    def _grouped_by_category(self, items: list[dict]) -> list[tuple[str, list[dict]]]:
+        buckets: dict[str | None, list[dict]] = {}
+        for item in items:
+            buckets.setdefault(item.get("category"), []).append(item)
+
+        groups: list[tuple[str, list[dict]]] = []
+        for name in self.categories:
+            if name in buckets:
+                groups.append((f"🏷 {name}", buckets.pop(name)))
+        # Por si algún acceso tiene una categoría que ya no existe en
+        # self.categories (se borró desde "Gestionar categorías" pero el
+        # archivo se editó a mano, etc.): se agrupan igual, no se pierden.
+        for name, group_items in list(buckets.items()):
+            if name:
+                groups.append((f"🏷 {name}", buckets.pop(name)))
+        if None in buckets:
+            groups.append(("Sin categoría", buckets.pop(None)))
+        return groups
 
     # ------------------------------------------------------------------
     # Selección de tarjetas (varias a la vez)
@@ -1645,6 +1824,23 @@ class AccesosDirectosApp:
             label="Restablecer color del tema",
             command=lambda: self._clear_items_color(items),
         )
+
+        category_menu = tk.Menu(menu, tearoff=0)
+        category_menu.add_command(
+            label="Sin categoría", command=lambda: self._set_items_category(items, None)
+        )
+        if self.categories:
+            category_menu.add_separator()
+            for name in self.categories:
+                category_menu.add_command(
+                    label=name, command=lambda n=name: self._set_items_category(items, n)
+                )
+        category_menu.add_separator()
+        category_menu.add_command(
+            label="Nueva categoría...", command=lambda: self._new_category_for_items(items)
+        )
+        menu.add_cascade(label="Categoría", menu=category_menu)
+
         menu.add_separator()
         menu.add_command(
             label=f"Eliminar {len(items)} elementos...",
@@ -1679,6 +1875,24 @@ class AccesosDirectosApp:
         item["category"] = name
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
+
+    def _set_items_category(self, items: list[dict], name: str | None) -> None:
+        for item in items:
+            item["category"] = name
+        save_shortcuts(self.shortcuts)
+        self._layout_tiles()
+
+    def _new_category_for_items(self, items: list[dict]) -> None:
+        name = self._prompt_name("Nueva categoría", title="Nombre de la categoría")
+        if not name:
+            return
+        _rgb, hex_color = colorchooser.askcolor(color="#38bdf8", title="Color de la categoría")
+        if not hex_color:
+            return
+        self.categories[name] = hex_color
+        self.settings["categories"] = self.categories
+        save_settings(self.settings)
+        self._set_items_category(items, name)
 
     def _new_category_for_item(self, item: dict) -> None:
         name = self._prompt_name("Nueva categoría", title="Nombre de la categoría")
@@ -1760,6 +1974,148 @@ class AccesosDirectosApp:
         ttk.Button(buttons, text="+ Nueva categoría", command=add_new).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Cerrar", command=dialog.destroy).pack(side="left")
 
+    def _relative_trash_time(self, deleted_at) -> str:
+        delta = time.time() - float(deleted_at or 0)
+        if delta < 3600:
+            return f"hace {max(1, int(delta // 60))} min"
+        if delta < 86400:
+            return f"hace {int(delta // 3600)} h"
+        days = int(delta // 86400)
+        return f"hace {days} día" + ("" if days == 1 else "s")
+
+    def _trash_days_left(self, deleted_at) -> int:
+        delta = time.time() - float(deleted_at or 0)
+        return max(0, int(TRASH_RETENTION_DAYS - delta / 86400))
+
+    def open_trash_dialog(self) -> None:
+        colors = self.colors
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Papelera")
+        dialog.configure(bg=colors["bg"])
+        dialog.geometry("420x440")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text=f"Los elementos se eliminan definitivamente a los {TRASH_RETENTION_DAYS} días.",
+            font=("Segoe UI", 8), fg=colors["text_muted"], bg=colors["bg"],
+            wraplength=380, justify="left",
+        ).pack(anchor="w", padx=16, pady=(14, 6))
+
+        list_container = tk.Frame(dialog, bg=colors["bg"])
+        list_container.pack(fill="both", expand=True, padx=16)
+
+        trash_canvas = tk.Canvas(list_container, bg=colors["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=trash_canvas.yview)
+        inner = tk.Frame(trash_canvas, bg=colors["bg"])
+        trash_canvas.create_window((0, 0), window=inner, anchor="nw")
+        trash_canvas.configure(yscrollcommand=scrollbar.set)
+        trash_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        inner.bind(
+            "<Configure>", lambda _e: trash_canvas.configure(scrollregion=trash_canvas.bbox("all"))
+        )
+
+        def restore_entry(entry: dict) -> None:
+            restored = dict(entry)
+            restored.pop("deleted_at", None)
+            valid_ids = {it["id"] for it in self.shortcuts}
+            if restored.get("parent_id") not in valid_ids:
+                # La carpeta que lo contenía ya no existe (se borró
+                # definitivamente o sigue en la papelera): se restaura en
+                # la raíz para no perderlo.
+                restored["parent_id"] = None
+            if any(it["id"] == restored["id"] for it in self.shortcuts):
+                restored["id"] = new_item_id()
+            siblings = [it for it in self.shortcuts if it["parent_id"] == restored.get("parent_id")]
+            restored["order"] = len(siblings)
+            self.shortcuts.append(restored)
+            self.trash = [e for e in self.trash if e is not entry]
+            save_shortcuts(self.shortcuts)
+            save_trash(self.trash)
+            self._layout_tiles()
+            render_list()
+
+        def delete_entry_forever(entry: dict) -> None:
+            if not messagebox.askyesno(
+                "Eliminar definitivamente",
+                f"¿Eliminar definitivamente «{entry.get('name', '')}»?\n\nEsto no se puede deshacer.",
+            ):
+                return
+            self.trash = [e for e in self.trash if e is not entry]
+            save_trash(self.trash)
+            render_list()
+
+        def empty_trash() -> None:
+            if not self.trash:
+                return
+            if not messagebox.askyesno(
+                "Vaciar papelera",
+                f"¿Eliminar definitivamente los {len(self.trash)} elementos de la papelera?\n\n"
+                "Esto no se puede deshacer.",
+            ):
+                return
+            self.trash = []
+            save_trash(self.trash)
+            render_list()
+
+        def render_list() -> None:
+            for child in inner.winfo_children():
+                child.destroy()
+            if not self.trash:
+                tk.Label(
+                    inner, text="La papelera está vacía.", fg=colors["text_muted"], bg=colors["bg"],
+                ).pack(anchor="w", pady=10)
+                empty_btn.configure(state="disabled")
+                return
+            empty_btn.configure(state="normal")
+            for entry in sorted(self.trash, key=lambda e: e.get("deleted_at", 0), reverse=True):
+                row = tk.Frame(inner, bg=colors["surface"])
+                row.pack(fill="x", pady=3)
+                icon = "📁" if entry.get("type") == "folder" else "📄"
+                tk.Label(
+                    row, text=icon, font=("Segoe UI Emoji", 12), bg=colors["surface"], fg=colors["text"],
+                ).pack(side="left", padx=(8, 6), pady=6)
+
+                text_col = tk.Frame(row, bg=colors["surface"])
+                text_col.pack(side="left", fill="both", expand=True)
+                tk.Label(
+                    text_col, text=entry.get("name", "(sin nombre)"), font=("Segoe UI", 9, "bold"),
+                    fg=colors["text"], bg=colors["surface"], anchor="w",
+                ).pack(fill="x")
+                days_left = self._trash_days_left(entry.get("deleted_at", 0))
+                tk.Label(
+                    text_col,
+                    text=(
+                        f"{self._relative_trash_time(entry.get('deleted_at', 0))} · "
+                        f"quedan {days_left} día" + ("" if days_left == 1 else "s")
+                    ),
+                    font=("Segoe UI", 8), fg=colors["text_muted"], bg=colors["surface"], anchor="w",
+                ).pack(fill="x")
+
+                restore_btn = tk.Label(
+                    row, text="↩ Restaurar", font=("Segoe UI", 8), fg=colors["accent"],
+                    bg=colors["surface"], cursor="hand2",
+                )
+                restore_btn.pack(side="left", padx=6)
+                restore_btn.bind("<Button-1>", lambda _e, en=entry: restore_entry(en))
+
+                delete_btn = tk.Label(
+                    row, text="🗑", font=("Segoe UI", 10), fg=colors["danger"],
+                    bg=colors["surface"], cursor="hand2",
+                )
+                delete_btn.pack(side="left", padx=(0, 8))
+                delete_btn.bind("<Button-1>", lambda _e, en=entry: delete_entry_forever(en))
+
+        buttons = tk.Frame(dialog, bg=colors["bg"], pady=12)
+        buttons.pack(fill="x", padx=16)
+        empty_btn = ttk.Button(buttons, text="Vaciar papelera", command=empty_trash)
+        empty_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Cerrar", command=dialog.destroy).pack(side="left")
+
+        render_list()
+
     def _move_item_to_parent(self, item: dict) -> None:
         self._move_items_to_parent([item])
 
@@ -1787,9 +2143,24 @@ class AccesosDirectosApp:
             save_shortcuts(self.shortcuts)
             self._layout_tiles()
 
+    def _move_to_trash(self, items: list[dict]) -> None:
+        """Guarda una copia de `items` en la papelera (con la hora de
+        borrado) antes de quitarlos de la lista activa."""
+        now = time.time()
+        for item in items:
+            entry = dict(item)
+            entry["deleted_at"] = now
+            self.trash.append(entry)
+        save_trash(self.trash)
+
     def _delete_shortcut(self, item: dict) -> None:
-        if not messagebox.askyesno("Quitar acceso", f"¿Quitar «{item['name']}»?"):
+        if not messagebox.askyesno(
+            "Quitar acceso",
+            f"¿Quitar «{item['name']}»?\n\nSe podrá recuperar desde la papelera "
+            f"durante {TRASH_RETENTION_DAYS} días.",
+        ):
             return
+        self._move_to_trash([item])
         self.shortcuts = [it for it in self.shortcuts if it["id"] != item["id"]]
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
@@ -1808,9 +2179,14 @@ class AccesosDirectosApp:
             for child in contents:
                 child["parent_id"] = item["parent_id"]
         else:
-            if not messagebox.askyesno("Eliminar carpeta", f"¿Eliminar la carpeta «{item['name']}»?"):
+            if not messagebox.askyesno(
+                "Eliminar carpeta",
+                f"¿Eliminar la carpeta «{item['name']}»?\n\nSe podrá recuperar desde la "
+                f"papelera durante {TRASH_RETENTION_DAYS} días.",
+            ):
                 return
 
+        self._move_to_trash([item])
         self.shortcuts = [it for it in self.shortcuts if it["id"] != item["id"]]
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
@@ -1823,7 +2199,8 @@ class AccesosDirectosApp:
             "Eliminar elementos",
             f"¿Eliminar {len(items)} elementos?\n\n{names_preview}\n\n"
             "El contenido de las carpetas eliminadas se moverá fuera de ellas "
-            "(no se borrará).",
+            "(no se borrará). Los elementos eliminados se podrán recuperar desde "
+            f"la papelera durante {TRASH_RETENTION_DAYS} días.",
         ):
             return
 
@@ -1834,6 +2211,7 @@ class AccesosDirectosApp:
                 for child in children:
                     child["parent_id"] = item["parent_id"]
 
+        self._move_to_trash(items)
         self.shortcuts = [it for it in self.shortcuts if it["id"] not in ids]
         self.selected_ids.clear()
         self._selection_anchor_id = None
@@ -2113,12 +2491,18 @@ class AccesosDirectosApp:
         self.root.update_idletasks()
         self._layout_tiles()
 
+    def _icon_cache_size_text(self) -> str:
+        size_bytes = win_icons.disk_cache_size_bytes()
+        if size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.0f} KB en disco"
+        return f"{size_bytes / (1024 * 1024):.1f} MB en disco"
+
     def open_settings_dialog(self) -> None:
         colors = self.colors
         dialog = tk.Toplevel(self.root)
         dialog.title("Configuración")
         dialog.configure(bg=colors["bg"])
-        dialog.geometry("360x440" if startup_supported() else "360x400")
+        dialog.geometry("360x520" if startup_supported() else "360x480")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -2170,6 +2554,29 @@ class AccesosDirectosApp:
             activebackground=colors["bg"], activeforeground=colors["text"],
             highlightthickness=0,
         ).pack(anchor="w", padx=18, pady=(6, 0))
+
+        tk.Label(
+            dialog, text="Caché de iconos", font=("Segoe UI", 10, "bold"),
+            fg=colors["text"], bg=colors["bg"],
+        ).pack(anchor="w", padx=18, pady=(16, 4))
+
+        cache_row = tk.Frame(dialog, bg=colors["bg"])
+        cache_row.pack(anchor="w", padx=18, fill="x")
+
+        cache_size_var = tk.StringVar(value=self._icon_cache_size_text())
+        tk.Label(
+            cache_row, textvariable=cache_size_var, font=("Segoe UI", 8),
+            fg=colors["text_muted"], bg=colors["bg"],
+        ).pack(side="left")
+
+        def clear_icon_cache() -> None:
+            win_icons.clear_disk_cache()
+            cache_size_var.set(self._icon_cache_size_text())
+            self._layout_tiles()
+
+        ttk.Button(cache_row, text="Vaciar caché de iconos", command=clear_icon_cache).pack(
+            side="left", padx=(10, 0)
+        )
 
         def save_and_close() -> None:
             self.settings["click_mode"] = click_var.get()

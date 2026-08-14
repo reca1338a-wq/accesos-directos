@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid as _uuid
 from pathlib import Path
 
@@ -38,6 +39,11 @@ else:
 
 SHORTCUTS_PATH = USER_DATA_DIR / "shortcuts.json"
 SETTINGS_PATH = USER_DATA_DIR / "settings.json"
+TRASH_PATH = USER_DATA_DIR / "trash.json"
+
+# Días que se conserva un elemento en la papelera antes de borrarse
+# definitivamente en solitario (al arrancar la app).
+TRASH_RETENTION_DAYS = 7
 
 # ---------------------------------------------------------------------------
 # Temas de color. Añade aquí nuevos temas si quieres más opciones futuras.
@@ -96,6 +102,7 @@ DEFAULT_SETTINGS = {
     "card_style": "cards",  # "cards" | "compact"
     "show_recent": True,
     "categories": {},  # nombre -> color hex, ej. {"Trabajo": "#38bdf8"}
+    "group_by_category": False,
 }
 
 DEFAULT_SHORTCUTS = [
@@ -155,6 +162,9 @@ def load_settings() -> dict:
     card_style = data.get("card_style", DEFAULT_SETTINGS["card_style"])
     merged["card_style"] = card_style if card_style in ("cards", "compact") else "cards"
     merged["show_recent"] = bool(data.get("show_recent", DEFAULT_SETTINGS["show_recent"]))
+    merged["group_by_category"] = bool(
+        data.get("group_by_category", DEFAULT_SETTINGS["group_by_category"])
+    )
     categories = data.get("categories", {})
     merged["categories"] = (
         {str(k): str(v) for k, v in categories.items()} if isinstance(categories, dict) else {}
@@ -399,6 +409,43 @@ def save_shortcuts(items: list[dict]) -> None:
     with SHORTCUTS_PATH.open("w", encoding="utf-8") as handle:
         json.dump({"items": normalized}, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# Papelera: los elementos borrados se guardan aquí durante
+# TRASH_RETENTION_DAYS días antes de eliminarse definitivamente, por si se
+# borran sin querer. No pasan por `_normalize_items` (que asigna un
+# "order" recalculado): se guardan tal cual estaban, para poder
+# restaurarlos con sus mismos datos.
+# ---------------------------------------------------------------------------
+
+
+def load_trash() -> list[dict]:
+    ensure_user_data_dir()
+    if not TRASH_PATH.exists():
+        return []
+    try:
+        with TRASH_PATH.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = data.get("items", []) if isinstance(data, dict) else []
+    return [it for it in items if isinstance(it, dict) and "id" in it]
+
+
+def save_trash(items: list[dict]) -> None:
+    ensure_user_data_dir()
+    with TRASH_PATH.open("w", encoding="utf-8") as handle:
+        json.dump({"items": items}, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def purge_old_trash(items: list[dict], days: int = TRASH_RETENTION_DAYS) -> tuple[list[dict], bool]:
+    """Quita de la lista los elementos borrados hace más de `days` días.
+    Devuelve (lista_filtrada, se_quitó_algo)."""
+    cutoff = time.time() - days * 86400
+    kept = [it for it in items if float(it.get("deleted_at", 0) or 0) >= cutoff]
+    return kept, len(kept) != len(items)
 
 
 def parse_shortcuts_file(path: Path) -> list[dict]:

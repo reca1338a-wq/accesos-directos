@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import shutil
 import sys
 from ctypes import wintypes
 from pathlib import Path
@@ -151,8 +152,38 @@ def get_icon_photo(path: str, size: int = 32):
 
 
 def clear_cache() -> None:
-    """Vacía la caché de iconos (por ejemplo al recargar la lista)."""
+    """Vacía la caché de iconos en memoria (por ejemplo al recargar la lista)."""
     _icon_cache.clear()
+
+
+def clear_disk_cache() -> None:
+    """Borra también la caché de iconos guardada en disco (los PNG de
+    icon_cache/). Con el tiempo, si se cambian muchos accesos, se pueden
+    acumular bastantes archivos ahí — esto la deja limpia; los iconos se
+    volverán a generar (y guardar) la próxima vez que se necesiten."""
+    clear_cache()
+    try:
+        if _DISK_CACHE_DIR.exists():
+            shutil.rmtree(_DISK_CACHE_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def disk_cache_size_bytes() -> int:
+    """Tamaño actual de la caché de iconos en disco, en bytes (0 si no
+    existe o no se puede leer)."""
+    if not _DISK_CACHE_DIR.exists():
+        return 0
+    total = 0
+    try:
+        for entry in _DISK_CACHE_DIR.glob("*.png"):
+            try:
+                total += entry.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
 
 
 def _extract_image_thumbnail(path: str, size: int):
