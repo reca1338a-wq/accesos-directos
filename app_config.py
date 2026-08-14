@@ -93,6 +93,9 @@ DEFAULT_SETTINGS = {
     "click_mode": "double",  # "single" o "double"
     "theme": DEFAULT_THEME,
     "sort_mode": "manual",  # "manual" | "name_asc" | "name_desc" | "folders_first"
+    "card_style": "cards",  # "cards" | "compact"
+    "show_recent": True,
+    "categories": {},  # nombre -> color hex, ej. {"Trabajo": "#38bdf8"}
 }
 
 DEFAULT_SHORTCUTS = [
@@ -149,6 +152,13 @@ def load_settings() -> dict:
     merged["theme"] = theme if theme in THEMES else DEFAULT_THEME
     sort_mode = data.get("sort_mode", DEFAULT_SETTINGS["sort_mode"])
     merged["sort_mode"] = sort_mode if sort_mode in SORT_MODES else "manual"
+    card_style = data.get("card_style", DEFAULT_SETTINGS["card_style"])
+    merged["card_style"] = card_style if card_style in ("cards", "compact") else "cards"
+    merged["show_recent"] = bool(data.get("show_recent", DEFAULT_SETTINGS["show_recent"]))
+    categories = data.get("categories", {})
+    merged["categories"] = (
+        {str(k): str(v) for k, v in categories.items()} if isinstance(categories, dict) else {}
+    )
     return merged
 
 
@@ -233,6 +243,43 @@ def set_startup_enabled(enabled: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def expand_path(path: str) -> str:
+    """Expande variables de entorno (%APPDATA%, %USERPROFILE%...) en una
+    ruta guardada. Si la ruta no las usa, la devuelve tal cual."""
+    return os.path.expandvars(path)
+
+
+def portabilize_path(path: str) -> str:
+    """Intenta sustituir el prefijo de una ruta absoluta (típicamente
+    dentro de la carpeta del usuario) por la variable de entorno
+    equivalente, para que el acceso funcione igual en otro PC/usuario.
+
+    Por ejemplo "C:\\Users\\manuel\\AppData\\Roaming\\X" se convierte en
+    "%APPDATA%\\X". Si no coincide con ninguna variable conocida, se deja
+    la ruta original sin tocar.
+    """
+    if sys.platform != "win32":
+        return path
+
+    candidates = [
+        ("APPDATA", os.environ.get("APPDATA")),
+        ("LOCALAPPDATA", os.environ.get("LOCALAPPDATA")),
+        ("USERPROFILE", os.environ.get("USERPROFILE")),
+        ("ProgramFiles(x86)", os.environ.get("ProgramFiles(x86)")),
+        ("ProgramFiles", os.environ.get("ProgramFiles")),
+        ("ProgramData", os.environ.get("ProgramData")),
+    ]
+    # Ordenamos por longitud de valor, de más específico a más genérico
+    # (APPDATA está dentro de USERPROFILE, así que debe probarse antes).
+    candidates = [(name, value) for name, value in candidates if value]
+    candidates.sort(key=lambda pair: len(pair[1]), reverse=True)
+
+    for name, value in candidates:
+        if path.lower().startswith(value.lower()):
+            return f"%{name}%" + path[len(value):]
+    return path
+
+
 def _normalize_items(raw: list) -> list[dict]:
     items: list[dict] = []
     seen_ids: set[str] = set()
@@ -263,6 +310,18 @@ def _normalize_items(raw: list) -> list[dict]:
         color = entry.get("color")
         color = str(color) if color else None
 
+        category = entry.get("category")
+        category = str(category) if category else None
+
+        try:
+            open_count = int(entry.get("open_count", 0))
+        except (TypeError, ValueError):
+            open_count = 0
+        try:
+            last_opened = float(entry.get("last_opened", 0) or 0)
+        except (TypeError, ValueError):
+            last_opened = 0.0
+
         item = {
             "id": item_id,
             "type": item_type,
@@ -271,6 +330,9 @@ def _normalize_items(raw: list) -> list[dict]:
             "order": entry.get("order", 0),
             "color": color,
             "size": size,
+            "category": category,
+            "open_count": open_count,
+            "last_opened": last_opened,
         }
 
         if item_type == "shortcut":
@@ -278,6 +340,8 @@ def _normalize_items(raw: list) -> list[dict]:
             if not path:
                 continue
             item["path"] = path
+            args = entry.get("args")
+            item["args"] = str(args) if args else None
 
         items.append(item)
 

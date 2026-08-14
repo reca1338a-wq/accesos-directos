@@ -24,6 +24,7 @@ se rompa.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import sys
 from ctypes import wintypes
 from pathlib import Path
@@ -35,6 +36,18 @@ try:
 except ImportError:  # Pillow no instalado.
     Image = None  # type: ignore[assignment]
     ImageTk = None  # type: ignore[assignment]
+
+try:
+    from app_config import USER_DATA_DIR
+except ImportError:  # por si se importa este módulo suelto, sin el resto de la app.
+    USER_DATA_DIR = Path.home() / ".accesos-directos"
+
+# Caché de iconos en disco: extraer un icono de Windows (SHGetFileInfoW +
+# dibujarlo en un DIB) no es carísimo, pero sí se nota al abrir la app con
+# muchas tarjetas, sobre todo porque la caché en memoria (`_icon_cache`, más
+# abajo) se vacía cada vez que se cierra la app. Guardar el resultado como
+# PNG hace que la *primera* carga tras abrir la app también sea rápida.
+_DISK_CACHE_DIR = USER_DATA_DIR / "icon_cache"
 
 # Extensiones que tratamos como "imagen": en vez de pedirle a Windows el
 # icono asociado a esa extensión, mostramos una miniatura real del propio
@@ -65,6 +78,43 @@ def icons_available() -> bool:
     return _ICON_SUPPORTED
 
 
+def _disk_cache_key(path: str, size: int) -> str:
+    # Se incluye la fecha de modificación del archivo (si existe) en la
+    # clave para que, si el usuario reemplaza el archivo por otro con el
+    # mismo nombre (por ejemplo un .exe distinto), el icono en caché
+    # quede obsoleto automáticamente en vez de mostrar el antiguo.
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        mtime = 0
+    raw = f"{path}|{size}|{mtime}".encode("utf-8", errors="ignore")
+    return hashlib.md5(raw).hexdigest()
+
+
+def _load_from_disk_cache(path: str, size: int):
+    if Image is None:
+        return None
+    cache_file = _DISK_CACHE_DIR / f"{_disk_cache_key(path, size)}.png"
+    if not cache_file.exists():
+        return None
+    try:
+        with Image.open(cache_file) as cached:
+            return cached.convert("RGBA")
+    except Exception:
+        return None
+
+
+def _save_to_disk_cache(path: str, size: int, image) -> None:
+    if image is None:
+        return
+    try:
+        _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_file = _DISK_CACHE_DIR / f"{_disk_cache_key(path, size)}.png"
+        image.save(cache_file, "PNG")
+    except Exception:
+        pass
+
+
 def get_icon_photo(path: str, size: int = 32):
     """Devuelve un ImageTk.PhotoImage para `path`, o None si no se puede.
 
@@ -83,10 +133,15 @@ def get_icon_photo(path: str, size: int = 32):
 
     photo = None
     try:
-        image = _extract_image_thumbnail(path, size)
-        if image is None and _ICON_SUPPORTED:
-            image = _extract_icon_image(path, size)
+        image = _load_from_disk_cache(path, size)
+        came_from_disk = image is not None
+        if image is None:
+            image = _extract_image_thumbnail(path, size)
+            if image is None and _ICON_SUPPORTED:
+                image = _extract_icon_image(path, size)
         if image is not None:
+            if not came_from_disk:
+                _save_to_disk_cache(path, size, image)
             photo = ImageTk.PhotoImage(image)
     except Exception:
         photo = None

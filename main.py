@@ -20,9 +20,11 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+import shlex
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
@@ -36,6 +38,7 @@ from app_config import (
     SIZE_PRESETS,
     THEMES,
     USER_DATA_DIR,
+    expand_path,
     export_shortcuts,
     get_app_version,
     get_theme,
@@ -44,6 +47,7 @@ from app_config import (
     load_settings,
     load_shortcuts,
     new_item_id,
+    portabilize_path,
     save_settings,
     save_shortcuts,
     set_startup_enabled,
@@ -96,10 +100,25 @@ SORT_OPTIONS = (
 )
 
 
-def open_path(path: str) -> None:
-    target = Path(path).expanduser()
+def open_path(path: str, args: str | None = None) -> None:
+    expanded = expand_path(path)
+    target = Path(expanded).expanduser()
     if not target.exists():
         raise FileNotFoundError(f"No se encontró: {target}")
+
+    if args:
+        # Acceso a un comando con argumentos (ej. abrir un archivo con un
+        # programa concreto, o lanzar una herramienta de línea de
+        # comandos). Se ejecuta directamente en vez de "abrir con la app
+        # predeterminada", ya que el propio acceso especifica el programa.
+        try:
+            parsed_args = shlex.split(expand_path(args), posix=(sys.platform != "win32"))
+        except ValueError as exc:
+            raise OSError(f"Argumentos no válidos: {exc}") from exc
+        import subprocess
+
+        subprocess.Popen([str(target), *parsed_args])
+        return
 
     if sys.platform == "win32":
         os.startfile(str(target))  # noqa: S606
@@ -128,18 +147,21 @@ def _readable_text_color(hex_color: str) -> str:
 class Tile(tk.Frame):
     """Una tarjeta arrastrable que representa un acceso directo o una carpeta."""
 
-    def __init__(self, master: tk.Misc, app: "AccesosDirectosApp", item: dict) -> None:
+    def __init__(
+        self, master: tk.Misc, app: "AccesosDirectosApp", item: dict, compact: bool = False
+    ) -> None:
         colors = app.colors
         preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
         custom_color = item.get("color")
         bg = custom_color or colors["surface"]
         text_color = _readable_text_color(custom_color) if custom_color else colors["text"]
         muted_color = text_color if custom_color else colors["text_muted"]
+        category_color = app.categories.get(item.get("category") or "")
 
         self.is_broken = (
             item["type"] == "shortcut"
             and bool(item.get("path"))
-            and not Path(item["path"]).expanduser().exists()
+            and not Path(expand_path(item["path"])).expanduser().exists()
         )
 
         self.selected = item["id"] in app.selected_ids
@@ -156,50 +178,82 @@ class Tile(tk.Frame):
         self.item = item
         self.base_bg = border_color
         self.preset = preset
+        self.compact = compact
         self._press_pos: tuple[int, int] | None = None
         self._dragging = False
         self._press_ctrl = False
         self._press_shift = False
 
+        # Franja de color de categoría, independiente del tema y del color
+        # de fondo de la tarjeta: solo sirve para agrupar visualmente.
+        if category_color:
+            tk.Frame(self, bg=category_color, height=4).pack(fill="x", side="top")
+
         self._icon_photo = None  # referencia viva: evita que Tk la recolecte
         icon_photo = None
         if item["type"] == "shortcut" and not self.is_broken:
             icon_size = ICON_PIXEL_SIZES.get(item.get("size", DEFAULT_SIZE), 32)
-            icon_photo = win_icons.get_icon_photo(item.get("path", ""), icon_size)
+            icon_photo = win_icons.get_icon_photo(expand_path(item.get("path", "")), icon_size)
 
-        if icon_photo is not None:
-            self._icon_photo = icon_photo
-            tk.Label(self, image=icon_photo, bg=bg).pack(pady=(14, 2))
-        else:
-            if self.is_broken:
-                icon = "⚠️"
+        if compact:
+            row = tk.Frame(self, bg=bg)
+            row.pack(fill="both", expand=True, padx=8, pady=4)
+
+            if icon_photo is not None:
+                self._icon_photo = icon_photo
+                tk.Label(row, image=icon_photo, bg=bg).pack(side="left", padx=(0, 8))
             else:
-                icon = "📁" if item["type"] == "folder" else "📄"
+                icon = "⚠️" if self.is_broken else ("📁" if item["type"] == "folder" else "📄")
+                tk.Label(
+                    row, text=icon, font=("Segoe UI Emoji", 14), fg=text_color, bg=bg
+                ).pack(side="left", padx=(0, 8))
+
+            text_col = tk.Frame(row, bg=bg)
+            text_col.pack(side="left", fill="both", expand=True)
             tk.Label(
-                self, text=icon, font=("Segoe UI Emoji", 18), fg=text_color, bg=bg
-            ).pack(pady=(14, 2))
+                text_col, text=item["name"], font=("Segoe UI", 10, "bold"), fg=text_color,
+                bg=bg, anchor="w",
+            ).pack(fill="x")
+            subtitle = self._subtitle(colors)
+            if subtitle:
+                tk.Label(
+                    text_col, text=subtitle, font=("Segoe UI", 8), fg=muted_color, bg=bg,
+                    anchor="w",
+                ).pack(fill="x")
+        else:
+            if icon_photo is not None:
+                self._icon_photo = icon_photo
+                tk.Label(self, image=icon_photo, bg=bg).pack(pady=(14, 2))
+            else:
+                if self.is_broken:
+                    icon = "⚠️"
+                else:
+                    icon = "📁" if item["type"] == "folder" else "📄"
+                tk.Label(
+                    self, text=icon, font=("Segoe UI Emoji", 18), fg=text_color, bg=bg
+                ).pack(pady=(14, 2))
 
-        tk.Label(
-            self,
-            text=item["name"],
-            font=("Segoe UI", 10, "bold"),
-            fg=text_color,
-            bg=bg,
-            wraplength=preset["width"] - 16,
-            justify="center",
-        ).pack(fill="x", padx=6)
-
-        subtitle = self._subtitle(colors)
-        if subtitle:
             tk.Label(
                 self,
-                text=subtitle,
-                font=("Segoe UI", 8),
-                fg=muted_color,
+                text=item["name"],
+                font=("Segoe UI", 10, "bold"),
+                fg=text_color,
                 bg=bg,
                 wraplength=preset["width"] - 16,
                 justify="center",
-            ).pack(fill="x", padx=6, pady=(2, 0))
+            ).pack(fill="x", padx=6)
+
+            subtitle = self._subtitle(colors)
+            if subtitle:
+                tk.Label(
+                    self,
+                    text=subtitle,
+                    font=("Segoe UI", 8),
+                    fg=muted_color,
+                    bg=bg,
+                    wraplength=preset["width"] - 16,
+                    justify="center",
+                ).pack(fill="x", padx=6, pady=(2, 0))
 
         for widget in self._all_children():
             widget.bind("<ButtonPress-1>", self._on_press)
@@ -291,6 +345,9 @@ class AccesosDirectosApp:
         self.colors = get_theme(self.settings.get("theme"))
         self.shortcuts = load_shortcuts()
         self.sort_mode = self.settings.get("sort_mode", "manual")
+        self.card_style = self.settings.get("card_style", "cards")
+        self.categories: dict[str, str] = self.settings.get("categories", {})
+        self.category_filter: str | None = None
 
         self.current_folder_id: str | None = None
         self.breadcrumb: list[tuple[str, str | None]] = [("Inicio", None)]
@@ -401,6 +458,8 @@ class AccesosDirectosApp:
 
         self._build_search_box(toolbar)
         self._build_sort_button(toolbar)
+        self._build_view_button(toolbar)
+        self._build_category_button(toolbar)
 
         hint_text = (
             "Arrastra sobre una carpeta o sobre la ruta de arriba para mover. "
@@ -420,6 +479,9 @@ class AccesosDirectosApp:
 
         canvas_frame = tk.Frame(self.root, bg=colors["bg"], padx=20, pady=8)
         canvas_frame.pack(fill="both", expand=True)
+
+        self.recent_frame = tk.Frame(canvas_frame, bg=colors["bg"])
+        self.recent_frame.pack(fill="x", pady=(0, 8))
 
         self.canvas = tk.Canvas(canvas_frame, bg=colors["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
@@ -478,6 +540,7 @@ class AccesosDirectosApp:
             command=self._toggle_auto_updates,
         )
         help_menu.add_separator()
+        help_menu.add_command(label="Reportar un problema...", command=self._report_issue)
         help_menu.add_command(label="Acerca de...", command=self.show_about)
         menubar.add_cascade(label="Ayuda", menu=help_menu)
 
@@ -585,6 +648,81 @@ class AccesosDirectosApp:
         self.settings["sort_mode"] = mode
         save_settings(self.settings)
         self.sort_button.configure(text=self._sort_button_text())
+        self._layout_tiles()
+
+    # -- vista compacta / cuadrícula --------------------------------------
+
+    def _build_view_button(self, parent: tk.Widget) -> None:
+        colors = self.colors
+        self.view_button = tk.Label(
+            parent,
+            text=self._view_button_text(),
+            font=("Segoe UI", 9),
+            fg=colors["text"],
+            bg=colors["surface"],
+            cursor="hand2",
+            padx=10,
+            pady=6,
+        )
+        self.view_button.pack(side="left", padx=(10, 0))
+        self.view_button.bind("<Button-1>", lambda _e: self._toggle_card_style())
+        self._add_tooltip(self.view_button, "Cambiar entre tarjetas y vista compacta")
+
+    def _view_button_text(self) -> str:
+        return "☰ Compacta" if self.card_style == "cards" else "▦ Tarjetas"
+
+    def _toggle_card_style(self) -> None:
+        self.card_style = "compact" if self.card_style == "cards" else "cards"
+        self.settings["card_style"] = self.card_style
+        save_settings(self.settings)
+        self.view_button.configure(text=self._view_button_text())
+        self._layout_tiles()
+
+    # -- filtro por categoría ----------------------------------------------
+
+    def _build_category_button(self, parent: tk.Widget) -> None:
+        colors = self.colors
+        self.category_button = tk.Label(
+            parent,
+            text=self._category_button_text(),
+            font=("Segoe UI", 9),
+            fg=colors["text"],
+            bg=colors["surface"],
+            cursor="hand2",
+            padx=10,
+            pady=6,
+        )
+        self.category_button.pack(side="left", padx=(10, 0))
+        self.category_button.bind("<Button-1>", self._show_category_filter_menu)
+        self._add_tooltip(self.category_button, "Filtrar por categoría")
+
+    def _category_button_text(self) -> str:
+        if not self.category_filter:
+            return "🏷 Todas"
+        if self.category_filter == "__none__":
+            return "🏷 Sin categoría"
+        return f"🏷 {self.category_filter}"
+
+    def _show_category_filter_menu(self, _event=None) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        mark = "●  " if not self.category_filter else "    "
+        menu.add_command(label=mark + "Todas", command=lambda: self._set_category_filter(None))
+        mark = "●  " if self.category_filter == "__none__" else "    "
+        menu.add_command(
+            label=mark + "Sin categoría", command=lambda: self._set_category_filter("__none__")
+        )
+        if self.categories:
+            menu.add_separator()
+            for name in self.categories:
+                mark = "●  " if self.category_filter == name else "    "
+                menu.add_command(label=mark + name, command=lambda n=name: self._set_category_filter(n))
+        x = self.category_button.winfo_rootx()
+        y = self.category_button.winfo_rooty() + self.category_button.winfo_height()
+        menu.tk_popup(x, y)
+
+    def _set_category_filter(self, value: str | None) -> None:
+        self.category_filter = value
+        self.category_button.configure(text=self._category_button_text())
         self._layout_tiles()
 
     def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
@@ -1004,11 +1142,20 @@ class AccesosDirectosApp:
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
         if query:
             matches = [it for it in self.shortcuts if query in it["name"].lower()]
+            matches = self._filter_by_category(matches)
             matches.sort(key=lambda it: it["name"].lower())
             return matches
 
         items = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
+        items = self._filter_by_category(items)
         return self._sort_items(items)
+
+    def _filter_by_category(self, items: list[dict]) -> list[dict]:
+        if not self.category_filter:
+            return items
+        if self.category_filter == "__none__":
+            return [it for it in items if not it.get("category")]
+        return [it for it in items if it.get("category") == self.category_filter]
 
     def _sort_items(self, items: list[dict]) -> list[dict]:
         mode = getattr(self, "sort_mode", "manual")
@@ -1024,6 +1171,41 @@ class AccesosDirectosApp:
     def _is_searching(self) -> bool:
         return bool(self.search_var.get().strip()) if hasattr(self, "search_var") else False
 
+    def _recent_items(self, limit: int = 6) -> list[dict]:
+        used = [
+            it for it in self.shortcuts
+            if it["type"] == "shortcut" and it.get("open_count", 0) > 0
+        ]
+        used.sort(key=lambda it: (it.get("open_count", 0), it.get("last_opened", 0)), reverse=True)
+        return used[:limit]
+
+    def _render_recent_section(self) -> None:
+        if not hasattr(self, "recent_frame"):
+            return
+        for child in self.recent_frame.winfo_children():
+            child.destroy()
+        self._recent_tile_by_id = {}
+
+        show = self.settings.get("show_recent", True)
+        items = self._recent_items() if show else []
+        if self._is_searching() or self.current_folder_id is not None or not items:
+            return  # el frame se queda vacío (altura ~0): no hace falta ocultarlo
+
+        colors = self.colors
+        tk.Label(
+            self.recent_frame, text="Recientes / más usados", font=("Segoe UI", 9, "bold"),
+            fg=colors["text_muted"], bg=colors["bg"],
+        ).pack(anchor="w")
+        strip = tk.Frame(self.recent_frame, bg=colors["bg"])
+        strip.pack(fill="x", pady=(4, 0))
+        for item in items:
+            tile = Tile(strip, self, item)
+            preset = tile.preset
+            tile.pack_propagate(False)
+            tile.configure(width=preset["width"], height=preset["height"])
+            tile.pack(side="left", padx=(0, 8))
+            self._recent_tile_by_id[item["id"]] = tile
+
     def _layout_tiles(self) -> None:
         self._resize_after_id = None
         for child in self.scrollable.winfo_children():
@@ -1031,6 +1213,7 @@ class AccesosDirectosApp:
 
         items = self._visible_items()
         canvas_width = max(self.canvas.winfo_width(), 240)
+        compact = self.card_style == "compact"
 
         if not items:
             self._tile_by_id = {}
@@ -1049,30 +1232,44 @@ class AccesosDirectosApp:
             ).place(x=20, y=30)
             self.scrollable.configure(width=canvas_width, height=140)
             self.canvas.configure(scrollregion=(0, 0, canvas_width, 140))
+            self._render_recent_section()
             return
 
-        x = TILE_GAP
-        y = TILE_GAP
-        row_height = 0
         self._tile_by_id = {}
-        for item in items:
-            preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
-            width, height = preset["width"], preset["height"]
-            if x + width + TILE_GAP > canvas_width and x > TILE_GAP:
-                x = TILE_GAP
+
+        if compact:
+            row_height = 44
+            y = TILE_GAP
+            row_width = max(canvas_width - 2 * TILE_GAP, 120)
+            for item in items:
+                tile = Tile(self.scrollable, self, item, compact=True)
+                tile.place(x=TILE_GAP, y=y, width=row_width, height=row_height)
+                self._tile_by_id[item["id"]] = tile
                 y += row_height + TILE_GAP
-                row_height = 0
+            total_height = y
+        else:
+            x = TILE_GAP
+            y = TILE_GAP
+            row_height = 0
+            for item in items:
+                preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
+                width, height = preset["width"], preset["height"]
+                if x + width + TILE_GAP > canvas_width and x > TILE_GAP:
+                    x = TILE_GAP
+                    y += row_height + TILE_GAP
+                    row_height = 0
 
-            tile = Tile(self.scrollable, self, item)
-            tile.place(x=x, y=y, width=width, height=height)
-            self._tile_by_id[item["id"]] = tile
+                tile = Tile(self.scrollable, self, item)
+                tile.place(x=x, y=y, width=width, height=height)
+                self._tile_by_id[item["id"]] = tile
 
-            x += width + TILE_GAP
-            row_height = max(row_height, height)
+                x += width + TILE_GAP
+                row_height = max(row_height, height)
+            total_height = y + row_height + TILE_GAP
 
-        total_height = y + row_height + TILE_GAP
         self.scrollable.configure(width=canvas_width, height=total_height)
         self.canvas.configure(scrollregion=(0, 0, canvas_width, total_height))
+        self._render_recent_section()
 
     # ------------------------------------------------------------------
     # Selección de tarjetas (varias a la vez)
@@ -1138,7 +1335,11 @@ class AccesosDirectosApp:
                 self.navigate_into(item)
             return
         try:
-            open_path(item["path"])
+            open_path(item["path"], item.get("args"))
+            item["open_count"] = item.get("open_count", 0) + 1
+            item["last_opened"] = time.time()
+            save_shortcuts(self.shortcuts)
+            self._render_recent_section()
         except FileNotFoundError:
             if messagebox.askyesno(
                 "Archivo no encontrado",
@@ -1403,6 +1604,31 @@ class AccesosDirectosApp:
             state="normal" if item.get("color") else "disabled",
         )
 
+        category_menu = tk.Menu(menu, tearoff=0)
+        mark = "●  " if not item.get("category") else "    "
+        category_menu.add_command(
+            label=mark + "Sin categoría", command=lambda: self._set_item_category(item, None)
+        )
+        if self.categories:
+            category_menu.add_separator()
+            for name in self.categories:
+                mark = "●  " if item.get("category") == name else "    "
+                category_menu.add_command(
+                    label=mark + name, command=lambda n=name: self._set_item_category(item, n)
+                )
+        category_menu.add_separator()
+        category_menu.add_command(
+            label="Nueva categoría...", command=lambda: self._new_category_for_item(item)
+        )
+        category_menu.add_command(label="Gestionar categorías...", command=self._manage_categories_dialog)
+        menu.add_cascade(label="Categoría", menu=category_menu)
+
+        if item["type"] == "shortcut":
+            menu.add_command(
+                label="Editar argumentos..." if item.get("args") else "Añadir argumentos...",
+                command=lambda: self._edit_item_args(item),
+            )
+
         menu.add_command(label="Renombrar...", command=lambda: self._rename_item(item))
 
         if self.current_folder_id is not None:
@@ -1467,6 +1693,134 @@ class AccesosDirectosApp:
         item["color"] = None
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
+
+    # -- categorías ---------------------------------------------------
+
+    def _set_item_category(self, item: dict, name: str | None) -> None:
+        item["category"] = name
+        save_shortcuts(self.shortcuts)
+        self._layout_tiles()
+
+    def _new_category_for_item(self, item: dict) -> None:
+        name = self._prompt_name("Nueva categoría", title="Nombre de la categoría")
+        if not name:
+            return
+        _rgb, hex_color = colorchooser.askcolor(color="#38bdf8", title="Color de la categoría")
+        if not hex_color:
+            return
+        self.categories[name] = hex_color
+        self.settings["categories"] = self.categories
+        save_settings(self.settings)
+        self._set_item_category(item, name)
+
+    def _manage_categories_dialog(self) -> None:
+        colors = self.colors
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Gestionar categorías")
+        dialog.configure(bg=colors["bg"])
+        dialog.geometry("320x360")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        list_frame = tk.Frame(dialog, bg=colors["bg"])
+        list_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+        def render_list() -> None:
+            for child in list_frame.winfo_children():
+                child.destroy()
+            if not self.categories:
+                tk.Label(
+                    list_frame, text="No has creado ninguna categoría todavía.",
+                    fg=colors["text_muted"], bg=colors["bg"], wraplength=280, justify="left",
+                ).pack(anchor="w", pady=(0, 10))
+            for name, color in list(self.categories.items()):
+                row = tk.Frame(list_frame, bg=colors["bg"])
+                row.pack(fill="x", pady=3)
+                tk.Frame(row, bg=color, width=16, height=16).pack(side="left", padx=(0, 8))
+                tk.Label(
+                    row, text=name, fg=colors["text"], bg=colors["bg"], anchor="w",
+                ).pack(side="left", fill="x", expand=True)
+                delete_btn = tk.Label(row, text="🗑", fg=colors["danger"], bg=colors["bg"], cursor="hand2")
+                delete_btn.pack(side="right")
+                delete_btn.bind("<Button-1>", lambda _e, n=name: delete_category(n))
+
+        def delete_category(name: str) -> None:
+            if not messagebox.askyesno(
+                "Eliminar categoría",
+                f"¿Eliminar la categoría «{name}»?\nLos accesos que la tengan se quedarán sin categoría.",
+            ):
+                return
+            self.categories.pop(name, None)
+            for it in self.shortcuts:
+                if it.get("category") == name:
+                    it["category"] = None
+            if self.category_filter == name:
+                self.category_filter = None
+                self.category_button.configure(text=self._category_button_text())
+            self.settings["categories"] = self.categories
+            save_settings(self.settings)
+            save_shortcuts(self.shortcuts)
+            render_list()
+            self._layout_tiles()
+
+        def add_new() -> None:
+            name = self._prompt_name("Nueva categoría", title="Nombre de la categoría")
+            if not name:
+                return
+            _rgb, hex_color = colorchooser.askcolor(color="#38bdf8", title="Color de la categoría")
+            if not hex_color:
+                return
+            self.categories[name] = hex_color
+            self.settings["categories"] = self.categories
+            save_settings(self.settings)
+            render_list()
+
+        render_list()
+        buttons = tk.Frame(dialog, bg=colors["bg"], pady=12)
+        buttons.pack(fill="x", padx=16)
+        ttk.Button(buttons, text="+ Nueva categoría", command=add_new).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Cerrar", command=dialog.destroy).pack(side="left")
+
+    # -- argumentos de comando -----------------------------------------
+
+    def _edit_item_args(self, item: dict) -> None:
+        colors = self.colors
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Argumentos del comando")
+        dialog.configure(bg=colors["bg"])
+        dialog.geometry("420x160")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text=f'Argumentos con los que se ejecuta «{item["name"]}»:',
+            fg=colors["text"], bg=colors["bg"], wraplength=380, justify="left",
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+        tk.Label(
+            dialog,
+            text='Ej. C:\\ruta\\archivo.txt   (admite variables como %APPDATA%). Déjalo vacío '
+            "para abrir el acceso con normalidad.",
+            font=("Segoe UI", 8), fg=colors["text_muted"], bg=colors["bg"],
+            wraplength=380, justify="left",
+        ).pack(anchor="w", padx=16)
+
+        entry = ttk.Entry(dialog, width=48)
+        entry.insert(0, item.get("args") or "")
+        entry.pack(padx=16, pady=8, fill="x")
+        entry.focus_set()
+
+        def confirm() -> None:
+            value = entry.get().strip()
+            item["args"] = value or None
+            save_shortcuts(self.shortcuts)
+            dialog.destroy()
+
+        buttons = tk.Frame(dialog, bg=colors["bg"], pady=8)
+        buttons.pack(fill="x", padx=16)
+        ttk.Button(buttons, text="Guardar", command=confirm).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="left")
+        entry.bind("<Return>", lambda _e: confirm())
 
     def _move_item_to_parent(self, item: dict) -> None:
         self._move_items_to_parent([item])
@@ -1606,6 +1960,11 @@ class AccesosDirectosApp:
             "Agrupa varias tarjetas dentro, como una carpeta interna de la app.",
             self.create_folder_dialog,
         )
+        option_card(
+            "⚡", "Comando personalizado",
+            "Ejecuta un programa con argumentos (ej. abrir un archivo con un editor concreto).",
+            self._add_command_shortcut,
+        )
 
         ttk.Button(dialog, text="Cancelar", command=dialog.destroy).pack(pady=(6, 14))
 
@@ -1620,6 +1979,49 @@ class AccesosDirectosApp:
         if not path:
             return
         self._finish_add_shortcut(path)
+
+    def _add_command_shortcut(self) -> None:
+        program = filedialog.askopenfilename(
+            title="Selecciona el programa a ejecutar (ej. notepad.exe)",
+            initialdir=str(Path.home()),
+        )
+        if not program:
+            return
+
+        colors = self.colors
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Comando personalizado")
+        dialog.configure(bg=colors["bg"])
+        dialog.geometry("420x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog, text=f"Programa: {Path(program).name}", font=("Segoe UI", 10, "bold"),
+            fg=colors["text"], bg=colors["bg"],
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+        tk.Label(
+            dialog,
+            text='Argumentos (opcional), ej. "C:\\ruta\\archivo.txt". Admite variables '
+            "como %APPDATA%.",
+            font=("Segoe UI", 8), fg=colors["text_muted"], bg=colors["bg"],
+            wraplength=380, justify="left",
+        ).pack(anchor="w", padx=16)
+
+        entry = ttk.Entry(dialog, width=48)
+        entry.pack(padx=16, pady=8, fill="x")
+        entry.focus_set()
+
+        def confirm() -> None:
+            args = entry.get().strip() or None
+            dialog.destroy()
+            self._finish_add_shortcut(program, args=args)
+
+        buttons = tk.Frame(dialog, bg=colors["bg"], pady=8)
+        buttons.pack(fill="x", padx=16)
+        ttk.Button(buttons, text="Continuar", command=confirm).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="left")
+        entry.bind("<Return>", lambda _e: confirm())
 
     def _repair_shortcut_path(self, item: dict) -> None:
         """Deja elegir la nueva ubicación de un acceso cuya ruta original
@@ -1644,8 +2046,9 @@ class AccesosDirectosApp:
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
 
-    def _finish_add_shortcut(self, path: str) -> None:
-        existing = self._find_duplicate_shortcut(path, self.current_folder_id)
+    def _finish_add_shortcut(self, path: str, args: str | None = None) -> None:
+        portable_path = portabilize_path(path)
+        existing = self._find_duplicate_shortcut(portable_path, self.current_folder_id)
         if existing is not None:
             if not self._confirm_overwrite_duplicate(existing):
                 return
@@ -1653,7 +2056,8 @@ class AccesosDirectosApp:
             if not name:
                 return
             existing["name"] = name
-            existing["path"] = path
+            existing["path"] = portable_path
+            existing["args"] = args
             save_shortcuts(self.shortcuts)
             self._layout_tiles()
             return
@@ -1667,7 +2071,8 @@ class AccesosDirectosApp:
                 "id": new_item_id(),
                 "type": "shortcut",
                 "name": name,
-                "path": path,
+                "path": portable_path,
+                "args": args,
                 "parent_id": self.current_folder_id,
                 "order": len(siblings),
                 "color": None,
@@ -1790,6 +2195,13 @@ class AccesosDirectosApp:
             f"Actualizaciones desde: github.com/{GITHUB_OWNER}/{GITHUB_REPO}",
         )
 
+    def _report_issue(self) -> None:
+        url = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/issues/new"
+        try:
+            webbrowser.open(url)
+        except Exception:
+            messagebox.showinfo("Reportar un problema", f"Abre este enlace en tu navegador:\n{url}")
+
     # ------------------------------------------------------------------
     # Configuración (clic y tema)
     # ------------------------------------------------------------------
@@ -1819,7 +2231,7 @@ class AccesosDirectosApp:
         dialog = tk.Toplevel(self.root)
         dialog.title("Configuración")
         dialog.configure(bg=colors["bg"])
-        dialog.geometry("360x330")
+        dialog.geometry("360x440" if startup_supported() else "360x400")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1862,16 +2274,29 @@ class AccesosDirectosApp:
                 highlightthickness=0,
             ).pack(anchor="w", padx=18, pady=(16, 0))
 
+        recent_var = tk.BooleanVar(value=self.settings.get("show_recent", True))
+        tk.Checkbutton(
+            dialog,
+            text="Mostrar sección de recientes / más usados",
+            variable=recent_var,
+            fg=colors["text"], bg=colors["bg"], selectcolor=colors["surface"],
+            activebackground=colors["bg"], activeforeground=colors["text"],
+            highlightthickness=0,
+        ).pack(anchor="w", padx=18, pady=(6, 0))
+
         def save_and_close() -> None:
             self.settings["click_mode"] = click_var.get()
             theme_changed = theme_var.get() != self.settings.get("theme")
             self.settings["theme"] = theme_var.get()
+            self.settings["show_recent"] = recent_var.get()
             save_settings(self.settings)
             if startup_supported():
                 set_startup_enabled(startup_var.get())
             dialog.destroy()
             if theme_changed:
                 self._apply_theme_live(self.settings["theme"])
+            else:
+                self._render_recent_section()
 
         buttons = tk.Frame(dialog, bg=colors["bg"], pady=14)
         buttons.pack(fill="x", padx=18)
