@@ -20,7 +20,6 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
-import shlex
 import threading
 import time
 import tkinter as tk
@@ -100,25 +99,11 @@ SORT_OPTIONS = (
 )
 
 
-def open_path(path: str, args: str | None = None) -> None:
+def open_path(path: str) -> None:
     expanded = expand_path(path)
     target = Path(expanded).expanduser()
     if not target.exists():
         raise FileNotFoundError(f"No se encontró: {target}")
-
-    if args:
-        # Acceso a un comando con argumentos (ej. abrir un archivo con un
-        # programa concreto, o lanzar una herramienta de línea de
-        # comandos). Se ejecuta directamente en vez de "abrir con la app
-        # predeterminada", ya que el propio acceso especifica el programa.
-        try:
-            parsed_args = shlex.split(expand_path(args), posix=(sys.platform != "win32"))
-        except ValueError as exc:
-            raise OSError(f"Argumentos no válidos: {exc}") from exc
-        import subprocess
-
-        subprocess.Popen([str(target), *parsed_args])
-        return
 
     if sys.platform == "win32":
         os.startfile(str(target))  # noqa: S606
@@ -1335,7 +1320,7 @@ class AccesosDirectosApp:
                 self.navigate_into(item)
             return
         try:
-            open_path(item["path"], item.get("args"))
+            open_path(item["path"])
             item["open_count"] = item.get("open_count", 0) + 1
             item["last_opened"] = time.time()
             save_shortcuts(self.shortcuts)
@@ -1623,12 +1608,6 @@ class AccesosDirectosApp:
         category_menu.add_command(label="Gestionar categorías...", command=self._manage_categories_dialog)
         menu.add_cascade(label="Categoría", menu=category_menu)
 
-        if item["type"] == "shortcut":
-            menu.add_command(
-                label="Editar argumentos..." if item.get("args") else "Añadir argumentos...",
-                command=lambda: self._edit_item_args(item),
-            )
-
         menu.add_command(label="Renombrar...", command=lambda: self._rename_item(item))
 
         if self.current_folder_id is not None:
@@ -1781,47 +1760,6 @@ class AccesosDirectosApp:
         ttk.Button(buttons, text="+ Nueva categoría", command=add_new).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Cerrar", command=dialog.destroy).pack(side="left")
 
-    # -- argumentos de comando -----------------------------------------
-
-    def _edit_item_args(self, item: dict) -> None:
-        colors = self.colors
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Argumentos del comando")
-        dialog.configure(bg=colors["bg"])
-        dialog.geometry("420x160")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(
-            dialog,
-            text=f'Argumentos con los que se ejecuta «{item["name"]}»:',
-            fg=colors["text"], bg=colors["bg"], wraplength=380, justify="left",
-        ).pack(anchor="w", padx=16, pady=(16, 4))
-        tk.Label(
-            dialog,
-            text='Ej. C:\\ruta\\archivo.txt   (admite variables como %APPDATA%). Déjalo vacío '
-            "para abrir el acceso con normalidad.",
-            font=("Segoe UI", 8), fg=colors["text_muted"], bg=colors["bg"],
-            wraplength=380, justify="left",
-        ).pack(anchor="w", padx=16)
-
-        entry = ttk.Entry(dialog, width=48)
-        entry.insert(0, item.get("args") or "")
-        entry.pack(padx=16, pady=8, fill="x")
-        entry.focus_set()
-
-        def confirm() -> None:
-            value = entry.get().strip()
-            item["args"] = value or None
-            save_shortcuts(self.shortcuts)
-            dialog.destroy()
-
-        buttons = tk.Frame(dialog, bg=colors["bg"], pady=8)
-        buttons.pack(fill="x", padx=16)
-        ttk.Button(buttons, text="Guardar", command=confirm).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="left")
-        entry.bind("<Return>", lambda _e: confirm())
-
     def _move_item_to_parent(self, item: dict) -> None:
         self._move_items_to_parent([item])
 
@@ -1960,12 +1898,6 @@ class AccesosDirectosApp:
             "Agrupa varias tarjetas dentro, como una carpeta interna de la app.",
             self.create_folder_dialog,
         )
-        option_card(
-            "⚡", "Comando personalizado",
-            "Ejecuta un programa con argumentos (ej. abrir un archivo con un editor concreto).",
-            self._add_command_shortcut,
-        )
-
         ttk.Button(dialog, text="Cancelar", command=dialog.destroy).pack(pady=(6, 14))
 
     def _add_file_shortcut(self) -> None:
@@ -1979,49 +1911,6 @@ class AccesosDirectosApp:
         if not path:
             return
         self._finish_add_shortcut(path)
-
-    def _add_command_shortcut(self) -> None:
-        program = filedialog.askopenfilename(
-            title="Selecciona el programa a ejecutar (ej. notepad.exe)",
-            initialdir=str(Path.home()),
-        )
-        if not program:
-            return
-
-        colors = self.colors
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Comando personalizado")
-        dialog.configure(bg=colors["bg"])
-        dialog.geometry("420x180")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(
-            dialog, text=f"Programa: {Path(program).name}", font=("Segoe UI", 10, "bold"),
-            fg=colors["text"], bg=colors["bg"],
-        ).pack(anchor="w", padx=16, pady=(16, 4))
-        tk.Label(
-            dialog,
-            text='Argumentos (opcional), ej. "C:\\ruta\\archivo.txt". Admite variables '
-            "como %APPDATA%.",
-            font=("Segoe UI", 8), fg=colors["text_muted"], bg=colors["bg"],
-            wraplength=380, justify="left",
-        ).pack(anchor="w", padx=16)
-
-        entry = ttk.Entry(dialog, width=48)
-        entry.pack(padx=16, pady=8, fill="x")
-        entry.focus_set()
-
-        def confirm() -> None:
-            args = entry.get().strip() or None
-            dialog.destroy()
-            self._finish_add_shortcut(program, args=args)
-
-        buttons = tk.Frame(dialog, bg=colors["bg"], pady=8)
-        buttons.pack(fill="x", padx=16)
-        ttk.Button(buttons, text="Continuar", command=confirm).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="left")
-        entry.bind("<Return>", lambda _e: confirm())
 
     def _repair_shortcut_path(self, item: dict) -> None:
         """Deja elegir la nueva ubicación de un acceso cuya ruta original
@@ -2046,7 +1935,7 @@ class AccesosDirectosApp:
         save_shortcuts(self.shortcuts)
         self._layout_tiles()
 
-    def _finish_add_shortcut(self, path: str, args: str | None = None) -> None:
+    def _finish_add_shortcut(self, path: str) -> None:
         portable_path = portabilize_path(path)
         existing = self._find_duplicate_shortcut(portable_path, self.current_folder_id)
         if existing is not None:
@@ -2057,7 +1946,6 @@ class AccesosDirectosApp:
                 return
             existing["name"] = name
             existing["path"] = portable_path
-            existing["args"] = args
             save_shortcuts(self.shortcuts)
             self._layout_tiles()
             return
@@ -2072,7 +1960,6 @@ class AccesosDirectosApp:
                 "type": "shortcut",
                 "name": name,
                 "path": portable_path,
-                "args": args,
                 "parent_id": self.current_folder_id,
                 "order": len(siblings),
                 "color": None,

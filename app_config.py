@@ -340,8 +340,6 @@ def _normalize_items(raw: list) -> list[dict]:
             if not path:
                 continue
             item["path"] = path
-            args = entry.get("args")
-            item["args"] = str(args) if args else None
 
         items.append(item)
 
