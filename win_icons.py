@@ -116,6 +116,34 @@ def _save_to_disk_cache(path: str, size: int, image) -> None:
         pass
 
 
+def _get_icon_image(path: str, size: int):
+    """Como get_icon_photo, pero devuelve la imagen PIL (RGBA) en vez de
+    convertirla ya a PhotoImage — la usa tanto get_icon_photo como el
+    compositor de iconos de carpeta (compose_folder_icon)."""
+    if not path or Image is None:
+        return None
+    image = _load_from_disk_cache(path, size)
+    if image is not None:
+        return image
+    image = _extract_image_thumbnail(path, size)
+    if image is None and _ICON_SUPPORTED:
+        image = _extract_icon_image(path, size)
+    if image is not None:
+        _save_to_disk_cache(path, size, image)
+    return image
+
+
+def get_icon_image(path: str, size: int = 32):
+    """Versión pública de `_get_icon_image`: la imagen PIL (no
+    PhotoImage) del icono de `path`, o None. Pensada para quien necesite
+    recomponerla con otras imágenes antes de convertirla a PhotoImage
+    (ver `compose_folder_icon`)."""
+    try:
+        return _get_icon_image(path, size)
+    except Exception:
+        return None
+
+
 def get_icon_photo(path: str, size: int = 32):
     """Devuelve un ImageTk.PhotoImage para `path`, o None si no se puede.
 
@@ -134,15 +162,8 @@ def get_icon_photo(path: str, size: int = 32):
 
     photo = None
     try:
-        image = _load_from_disk_cache(path, size)
-        came_from_disk = image is not None
-        if image is None:
-            image = _extract_image_thumbnail(path, size)
-            if image is None and _ICON_SUPPORTED:
-                image = _extract_icon_image(path, size)
+        image = _get_icon_image(path, size)
         if image is not None:
-            if not came_from_disk:
-                _save_to_disk_cache(path, size, image)
             photo = ImageTk.PhotoImage(image)
     except Exception:
         photo = None
@@ -151,9 +172,93 @@ def get_icon_photo(path: str, size: int = 32):
     return photo
 
 
+# ---------------------------------------------------------------------------
+# Icono de carpeta "con contenido": en vez del icono genérico de carpeta,
+# se compone una carpeta de verdad (dibujada) con hasta 3 miniaturas de
+# sus elementos metidas dentro, como tarjetitas — más parecido a como
+# Windows muestra las carpetas con contenido, y más vistoso que poner los
+# 3 iconos sueltos en fila al lado del icono de carpeta.
+# ---------------------------------------------------------------------------
+
+_folder_icon_cache: dict[tuple, object] = {}
+
+_FOLDER_TAB_COLOR = (214, 163, 33, 255)
+_FOLDER_BODY_COLOR = (247, 191, 63, 255)
+_FOLDER_BODY_SHADE = (232, 174, 45, 255)
+
+
+def compose_folder_icon(preview_paths: "list[str | None]", size: int = 40):
+    """Dibuja un icono de carpeta con hasta 3 miniaturas de
+    `preview_paths` (rutas de archivo; None se ignora, por ejemplo para
+    subcarpetas) colocadas dentro, a modo de vista previa del contenido.
+    Devuelve un ImageTk.PhotoImage, o None si Pillow no está disponible.
+    """
+    if Image is None or ImageTk is None:
+        return None
+
+    key = (tuple(preview_paths), size)
+    if key in _folder_icon_cache:
+        return _folder_icon_cache[key]
+
+    from PIL import ImageDraw
+
+    mini_size = max(10, round(size * 0.42))
+    previews = []
+    for p in preview_paths[:3]:
+        previews.append(get_icon_image(p, mini_size) if p else None)
+    previews = [p for p in previews if p is not None]
+
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    radius = max(2, round(size * 0.09))
+    tab_h = max(3, round(size * 0.16))
+    body_top = tab_h - max(1, round(size * 0.03))
+
+    # Pestaña de la carpeta.
+    draw.rounded_rectangle(
+        [round(size * 0.05), 0, round(size * 0.55), tab_h + radius],
+        radius=radius, fill=_FOLDER_TAB_COLOR,
+    )
+    # Cuerpo de la carpeta.
+    draw.rounded_rectangle(
+        [round(size * 0.03), body_top, size - round(size * 0.03), size - round(size * 0.06)],
+        radius=radius, fill=_FOLDER_BODY_COLOR,
+    )
+    # Una franja algo más oscura abajo, para dar sensación de volumen sin
+    # complicarse con degradados.
+    draw.rounded_rectangle(
+        [round(size * 0.03), size - round(size * 0.28), size - round(size * 0.03), size - round(size * 0.06)],
+        radius=radius, fill=_FOLDER_BODY_SHADE,
+    )
+
+    if previews:
+        gap = max(1, round(size * 0.035))
+        n = len(previews)
+        total_w = mini_size * n + gap * (n - 1)
+        start_x = (size - total_w) // 2
+        y = body_top + round(size * 0.24)
+        card_radius = max(1, round(mini_size * 0.22))
+        for i, mini in enumerate(previews):
+            card = Image.new("RGBA", (mini_size, mini_size), (0, 0, 0, 0))
+            card_draw = ImageDraw.Draw(card)
+            card_draw.rounded_rectangle(
+                [0, 0, mini_size - 1, mini_size - 1], radius=card_radius, fill=(255, 255, 255, 240),
+            )
+            inner = mini.convert("RGBA").resize(
+                (max(1, mini_size - 4), max(1, mini_size - 4)), Image.LANCZOS
+            )
+            card.paste(inner, (2, 2), inner)
+            canvas.paste(card, (start_x + i * (mini_size + gap), y), card)
+
+    photo = ImageTk.PhotoImage(canvas)
+    _folder_icon_cache[key] = photo
+    return photo
+
+
 def clear_cache() -> None:
     """Vacía la caché de iconos en memoria (por ejemplo al recargar la lista)."""
     _icon_cache.clear()
+    _folder_icon_cache.clear()
 
 
 def clear_disk_cache() -> None:

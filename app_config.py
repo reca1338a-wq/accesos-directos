@@ -103,6 +103,7 @@ DEFAULT_SETTINGS = {
     "show_recent": True,
     "categories": {},  # nombre -> color hex, ej. {"Trabajo": "#38bdf8"}
     "group_by_category": False,
+    "window_geometry": "",  # "WxH+X+Y", como devuelve root.geometry(); vacío = usar el tamaño por defecto
 }
 
 DEFAULT_SHORTCUTS = [
@@ -165,6 +166,8 @@ def load_settings() -> dict:
     merged["group_by_category"] = bool(
         data.get("group_by_category", DEFAULT_SETTINGS["group_by_category"])
     )
+    geometry = data.get("window_geometry", "")
+    merged["window_geometry"] = str(geometry) if isinstance(geometry, str) else ""
     categories = data.get("categories", {})
     merged["categories"] = (
         {str(k): str(v) for k, v in categories.items()} if isinstance(categories, dict) else {}

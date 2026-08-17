@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 # El .exe se compila como app "windowed" (sin consola, ver main.spec:
@@ -179,7 +180,6 @@ class Tile(tk.Frame):
             tk.Frame(self, bg=category_color, height=4).pack(fill="x", side="top")
 
         self._icon_photo = None  # referencia viva: evita que Tk la recolecte
-        self._folder_preview_photos: list = []  # referencias vivas del mosaico de carpeta
         icon_photo = None
         if item["type"] == "shortcut" and not self.is_broken:
             icon_size = ICON_PIXEL_SIZES.get(item.get("size", DEFAULT_SIZE), 32)
@@ -243,33 +243,25 @@ class Tile(tk.Frame):
         self, parent: tk.Misc, bg: str, text_color: str, icon_photo, icon_font_size: int
     ) -> tk.Widget:
         """Construye el icono principal de la tarjeta. Para una carpeta con
-        contenido, es un pequeño mosaico con los iconos de hasta 3 de sus
-        elementos (al estilo del Explorador de Windows) en vez del icono
-        genérico de carpeta."""
+        contenido, es un icono de carpeta "de verdad" (dibujado) con
+        hasta 3 miniaturas de sus elementos metidas dentro, en vez del
+        mosaico plano de antes o el icono genérico."""
         if self.item["type"] == "folder":
             children = sorted(
                 (c for c in self.app.shortcuts if c["parent_id"] == self.item["id"]),
                 key=lambda c: c.get("order", 0),
-            )[:3]
-            if children:
-                mosaic = tk.Frame(parent, bg=bg)
-                mini_size = 13 if self.compact else 20
-                for child in children:
-                    mini_photo = None
-                    if child["type"] == "shortcut":
-                        mini_photo = win_icons.get_icon_photo(
-                            expand_path(child.get("path", "")), mini_size
-                        )
-                    if mini_photo is not None:
-                        self._folder_preview_photos.append(mini_photo)
-                        tk.Label(mosaic, image=mini_photo, bg=bg).pack(side="left", padx=1)
-                    else:
-                        mini_icon = "📁" if child["type"] == "folder" else "📄"
-                        tk.Label(
-                            mosaic, text=mini_icon, font=("Segoe UI Emoji", mini_size - 4),
-                            fg=text_color, bg=bg,
-                        ).pack(side="left", padx=1)
-                return mosaic
+            )
+            preview_paths = [
+                expand_path(c.get("path", ""))
+                for c in children
+                if c["type"] == "shortcut"
+            ][:3]
+            if preview_paths:
+                folder_size = 26 if self.compact else 40
+                folder_photo = win_icons.compose_folder_icon(preview_paths, folder_size)
+                if folder_photo is not None:
+                    self._icon_photo = folder_photo
+                    return tk.Label(parent, image=folder_photo, bg=bg)
 
         if icon_photo is not None:
             self._icon_photo = icon_photo
@@ -399,7 +391,7 @@ class AccesosDirectosApp:
 
         self.root = TkinterDnD.Tk() if _DND_AVAILABLE else tk.Tk()
         self.root.title("Accesos Directos")
-        self.root.geometry("760x560")
+        self.root.geometry(self._initial_geometry())
         self.root.minsize(420, 320)
         self.root.configure(bg=self.colors["bg"])
 
@@ -408,6 +400,14 @@ class AccesosDirectosApp:
         self._layout_tiles()
 
         self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
+
+        # Recuerda el tamaño/posición de la ventana entre sesiones: se
+        # guarda con un pequeño retardo tras cada cambio (para no escribir
+        # a disco en cada píxel mientras se arrastra el borde) y también
+        # al cerrar la app, sea con la X o con Archivo → Salir.
+        self._geometry_save_after_id: str | None = None
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self._quit_app)
 
         # Navegación con flechas por la cuadrícula de tarjetas (ver
         # _build_search_box para cómo se entra en este modo desde el
@@ -491,20 +491,21 @@ class AccesosDirectosApp:
         )
         if _DND_AVAILABLE:
             hint_text += " Arrastra un archivo desde el Explorador para crear su acceso."
-        tk.Label(
+        hint_icon = tk.Label(
             toolbar,
-            text=hint_text,
-            font=("Segoe UI", 8),
+            text="ⓘ",
+            font=("Segoe UI", 11),
             fg=colors["text_muted"],
             bg=colors["bg"],
-            wraplength=380,
-            justify="left",
-        ).pack(side="left", padx=(14, 0))
+            cursor="hand2",
+        )
+        hint_icon.pack(side="left", padx=(14, 0))
+        self._add_tooltip(hint_icon, hint_text, wraplength=260)
 
         canvas_frame = tk.Frame(self.root, bg=colors["bg"], padx=20, pady=8)
         canvas_frame.pack(fill="both", expand=True)
 
-        self.recent_frame = tk.Frame(canvas_frame, bg=colors["bg"])
+        self.recent_frame = tk.Frame(canvas_frame, bg=colors["bg"], padx=TILE_GAP)
         self.recent_frame.pack(fill="x", pady=(0, 8))
 
         self.canvas = tk.Canvas(canvas_frame, bg=colors["bg"], highlightthickness=0)
@@ -558,7 +559,7 @@ class AccesosDirectosApp:
         file_menu.add_separator()
         file_menu.add_command(label="🗑 Papelera...", command=self.open_trash_dialog)
         file_menu.add_separator()
-        file_menu.add_command(label="Salir", command=self.root.quit)
+        file_menu.add_command(label="Salir", command=self._quit_app)
         menubar.add_cascade(label="Archivo", menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -772,7 +773,7 @@ class AccesosDirectosApp:
         self.category_button.configure(text=self._category_button_text())
         self._layout_tiles()
 
-    def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
+    def _add_tooltip(self, widget: tk.Widget, text: str, wraplength: int = 0) -> None:
         colors = self.colors
         state = {"win": None}
 
@@ -785,7 +786,8 @@ class AccesosDirectosApp:
             win.geometry(f"+{x}+{y}")
             tk.Label(
                 win, text=text, font=("Segoe UI", 8), fg=colors["text"], bg=colors["surface"],
-                padx=6, pady=3,
+                padx=6, pady=3, justify="left",
+                wraplength=wraplength if wraplength else 0,
             ).pack()
             state["win"] = win
 
@@ -1355,7 +1357,7 @@ class AccesosDirectosApp:
                 fg=self.colors["text_muted"],
                 bg=self.colors["bg"],
                 justify="center",
-            ).place(x=20, y=30)
+            ).place(x=TILE_GAP, y=30)
             self.scrollable.configure(width=canvas_width, height=140)
             self.canvas.configure(scrollregion=(0, 0, canvas_width, 140))
             self._render_recent_section()
@@ -2837,6 +2839,48 @@ class AccesosDirectosApp:
             self.root.after(0, done)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Tamaño/posición de la ventana (se recuerda entre sesiones)
+    # ------------------------------------------------------------------
+
+    def _initial_geometry(self) -> str:
+        default = "760x560"
+        saved = self.settings.get("window_geometry", "")
+        if not saved:
+            return default
+        match = re.match(r"^(\d+)x(\d+)([+-]\d+[+-]\d+)?$", saved)
+        if not match:
+            return default
+        width, height = int(match.group(1)), int(match.group(2))
+        # Alguna comprobación de cordura básica: si la ventana guardada es
+        # absurdamente pequeña, o clarísimamente no cabría en ninguna
+        # pantalla razonable, mejor usar el tamaño por defecto que abrir
+        # algo roto o invisible.
+        if width < 300 or height < 200 or width > 8000 or height > 8000:
+            return default
+        return saved
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        if self._geometry_save_after_id is not None:
+            self.root.after_cancel(self._geometry_save_after_id)
+        self._geometry_save_after_id = self.root.after(600, self._save_window_geometry)
+
+    def _save_window_geometry(self) -> None:
+        self._geometry_save_after_id = None
+        try:
+            geometry = self.root.geometry()
+        except tk.TclError:
+            return
+        if self.settings.get("window_geometry") != geometry:
+            self.settings["window_geometry"] = geometry
+            save_settings(self.settings)
+
+    def _quit_app(self) -> None:
+        self._save_window_geometry()
+        self.root.quit()
 
     def run(self) -> None:
         self.root.mainloop()
