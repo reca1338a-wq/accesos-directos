@@ -1,10 +1,13 @@
 # Dependencias de Accesos Directos.
 # Instalar con: pip install -r requirements.txt
-# (iniciar.bat ya lo hace automáticamente si detecta que faltan)
 
+PySide6>=6.6.0                          # Interfaz gráfica (Qt). Imprescindible: sin esto la app no arranca.
 Pillow>=10.0.0                          # Iconos reales de Windows y miniaturas de imagen.
-tkinterdnd2>=0.3.0                      # Arrastrar archivos desde el Explorador de Windows.
 
 # Nota: los iconos de Windows ya NO usan pywin32 (daba muchos problemas de
 # empaquetado con PyInstaller). Se piden directamente con ctypes, que ya
 # viene incluido en Python, así que no hace falta instalar nada más.
+#
+# tkinterdnd2 ya NO hace falta: era para el arrastrar-y-soltar de la
+# versión antigua con Tkinter. Con PySide6 el drag&drop se hace con las
+# clases propias de Qt (QDrag / dragEnterEvent...), sin dependencias extra.

@@ -2,12 +2,16 @@
 
 from PyInstaller.utils.hooks import collect_data_files
 
-# tkinterdnd2 necesita sus archivos Tcl empaquetados aparte (no son código
-# Python), o el arrastrar-y-soltar desde el Explorador no funcionará en el
-# .exe aunque funcione al ejecutar desde el código fuente.
+# PyInstaller ya trae un hook para PySide6 que detecta e incluye los
+# módulos Qt usados (QtCore/QtGui/QtWidgets) automáticamente. Aun así,
+# los plugins de Qt (sobre todo el de plataforma, "qwindows.dll", sin el
+# cual la app falla al arrancar con "could not find or load the Qt
+# platform plugin windows") a veces no se detectan solos según la
+# versión de PyInstaller/PySide6 — collect_data_files los fuerza a
+# incluirse siempre, por seguridad.
 datas = [('VERSION', '.')]
 try:
-    datas += collect_data_files('tkinterdnd2')
+    datas += collect_data_files('PySide6', includes=['plugins/platforms/*', 'plugins/styles/*'])
 except Exception:
     pass
 
@@ -16,7 +20,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['PIL._tkinter_finder'],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
