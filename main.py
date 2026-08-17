@@ -2739,42 +2739,100 @@ class AccesosDirectosApp:
             "Actualización disponible",
             f"Hay una nueva versión: {update.latest_version}\n"
             f"Versión actual: {update.current_version}\n\n"
-            "¿Quieres descargar e instalar la actualización?\n\nTus accesos directos no se modificarán.",
+            "¿Quieres descargar e instalar la actualización ahora?\n\n"
+            "Tus accesos directos no se modificarán. La app se reiniciará "
+            "sola en cuanto termine.",
         )
         if install:
             self._install_update(update, GITHUB_TOKEN)
 
+    def _format_eta(self, seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds} s"
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes} min {secs}s" if secs else f"{minutes} min"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} h {minutes} min"
+
     def _install_update(self, update, token: str) -> None:
         colors = self.colors
-        progress = tk.Toplevel(self.root)
-        progress.title("Actualizando...")
-        progress.configure(bg=colors["bg"])
-        progress.geometry("360x120")
-        progress.transient(self.root)
-        progress.grab_set()
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Actualizando...")
+        progress_win.configure(bg=colors["bg"])
+        progress_win.geometry("360x140")
+        progress_win.resizable(False, False)
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None)  # no cerrar a medias
+
+        status_var = tk.StringVar(value="Descargando actualización...")
         tk.Label(
-            progress, text="Descargando e instalando actualización...", fg=colors["text"], bg=colors["bg"],
-        ).pack(pady=24)
+            progress_win, textvariable=status_var, fg=colors["text"], bg=colors["bg"],
+        ).pack(pady=(20, 8), padx=20, anchor="w")
+
+        bar = ttk.Progressbar(progress_win, mode="determinate", maximum=100, length=320)
+        bar.pack(padx=20, pady=(0, 6))
+
+        detail_var = tk.StringVar(value="")
+        tk.Label(
+            progress_win, textvariable=detail_var, font=("Segoe UI", 8),
+            fg=colors["text_muted"], bg=colors["bg"],
+        ).pack(padx=20, anchor="w")
+
+        progress_state = {"downloaded": 0, "total": 0, "start": time.time(), "mode_set": False}
+
+        def refresh_progress_ui() -> None:
+            downloaded = progress_state["downloaded"]
+            total = progress_state["total"]
+            elapsed = time.time() - progress_state["start"]
+
+            if total > 0:
+                pct = min(100, downloaded / total * 100)
+                bar["value"] = pct
+                rate = downloaded / elapsed if elapsed > 0.2 else 0
+                eta_text = ""
+                if rate > 0:
+                    remaining = (total - downloaded) / rate
+                    eta_text = f" · quedan ~{self._format_eta(remaining)}"
+                detail_var.set(
+                    f"{downloaded / 1_048_576:.1f} / {total / 1_048_576:.1f} MB "
+                    f"({pct:.0f}%){eta_text}"
+                )
+            else:
+                # El servidor no mandó Content-Length: no sabemos el
+                # total, así que mostramos una barra "indeterminada" en
+                # vez de un porcentaje inventado.
+                if not progress_state["mode_set"]:
+                    bar.configure(mode="indeterminate")
+                    bar.start(12)
+                    progress_state["mode_set"] = True
+                detail_var.set(f"{downloaded / 1_048_576:.1f} MB descargados")
+
+        def on_progress(downloaded: int, total: int) -> None:
+            progress_state["downloaded"] = downloaded
+            progress_state["total"] = total
+            self.root.after(0, refresh_progress_ui)
 
         def worker() -> None:
             try:
-                apply_update(update.download_url, token, update.latest_version)
+                apply_update(update.download_url, token, update.latest_version, on_progress)
             except UpdateError as exc:
-                self.root.after(0, lambda: progress.destroy())
+                self.root.after(0, progress_win.destroy)
                 self.root.after(0, lambda: messagebox.showerror("Error de actualización", str(exc)))
                 return
 
             def done() -> None:
-                progress.destroy()
+                status_var.set("¡Listo! Reiniciando...")
+                if progress_state["mode_set"]:
+                    bar.stop()
+                bar.configure(mode="determinate")
+                bar["value"] = 100
                 self._clear_update_badge()
-                restart = messagebox.askyesno(
-                    "Actualización instalada",
-                    "La aplicación se ha actualizado correctamente.\n"
-                    "Tus accesos directos se mantienen intactos.\n\n"
-                    "¿Reiniciar ahora para aplicar los cambios?",
-                )
-                if restart:
-                    restart_with_update(self.root)
+                # Ya se confirmó al principio que se quería instalar: no
+                # hace falta preguntar otra vez si reiniciar, se hace solo.
+                self.root.after(600, lambda: restart_with_update(self.root))
 
             self.root.after(0, done)
 

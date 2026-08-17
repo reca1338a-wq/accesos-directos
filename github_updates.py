@@ -173,19 +173,44 @@ def cleanup_stale_update_files() -> None:
             pass
 
 
-def apply_update(download_url: str, token: str = "", latest_version: str = "") -> None:
+def _download_with_progress(request, destination: Path, progress_callback=None) -> None:
+    """Descarga `request` a `destination` en trozos, avisando del avance.
+
+    `progress_callback(downloaded_bytes, total_bytes)` se llama tras cada
+    trozo leído; `total_bytes` es 0 si el servidor no manda
+    Content-Length (raro, pero posible)."""
+    chunk_size = 262144  # 256 KB
+    with urllib.request.urlopen(request, timeout=120) as response:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        with destination.open("wb") as handle:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback is not None:
+                    progress_callback(downloaded, total)
+
+
+def apply_update(
+    download_url: str, token: str = "", latest_version: str = "", progress_callback=None
+) -> None:
     """Descarga e instala la actualización. Se adapta según si es .exe o .py sueltos."""
     if getattr(sys, "frozen", False):
-        _apply_update_exe(download_url, token, latest_version)
+        _apply_update_exe(download_url, token, latest_version, progress_callback)
     else:
-        _apply_update_source(download_url, token)
+        _apply_update_source(download_url, token, progress_callback)
 
 
 # ---------------------------------------------------------------------------
 # Modo .exe (aplicación empaquetada con PyInstaller)
 # ---------------------------------------------------------------------------
 
-def _apply_update_exe(download_url: str, token: str = "", latest_version: str = "") -> None:
+def _apply_update_exe(
+    download_url: str, token: str = "", latest_version: str = "", progress_callback=None
+) -> None:
     """Descarga el .zip de la nueva versión (app completa, modo onedir) y
     lo deja ya descomprimido en una carpeta de preparación, lista para
     aplicarse al reiniciar (ver `restart_with_update`)."""
@@ -199,8 +224,7 @@ def _apply_update_exe(download_url: str, token: str = "", latest_version: str = 
     zip_path = Path(tempfile.gettempdir()) / "accesos-directos-actualizacion.zip"
 
     try:
-        with urllib.request.urlopen(request, timeout=120) as response, zip_path.open("wb") as handle:
-            shutil.copyfileobj(response, handle)
+        _download_with_progress(request, zip_path, progress_callback)
 
         if staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -333,7 +357,7 @@ def restart_with_update(root=None) -> None:
 # Modo fuente (ejecutando con iniciar.bat / python main.py, sin compilar)
 # ---------------------------------------------------------------------------
 
-def _download_release_zip(download_url: str, token: str = "") -> Path:
+def _download_release_zip(download_url: str, token: str = "", progress_callback=None) -> Path:
     headers = {"User-Agent": "AccesosDirectos-Updater"}
     if token.strip():
         headers["Authorization"] = f"Bearer {token.strip()}"
@@ -344,8 +368,7 @@ def _download_release_zip(download_url: str, token: str = "") -> Path:
     temp_file.close()
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, temp_path.open("wb") as handle:
-            shutil.copyfileobj(response, handle)
+        _download_with_progress(request, temp_path, progress_callback)
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
@@ -362,8 +385,8 @@ def _find_repo_root(extracted_dir: Path) -> Path:
     return extracted_dir
 
 
-def _apply_update_source(download_url: str, token: str = "") -> None:
-    zip_path = _download_release_zip(download_url, token)
+def _apply_update_source(download_url: str, token: str = "", progress_callback=None) -> None:
+    zip_path = _download_release_zip(download_url, token, progress_callback)
     temp_dir = Path(tempfile.mkdtemp())
 
     try:
