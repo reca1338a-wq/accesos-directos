@@ -20,10 +20,28 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QMimeData, QPoint, QPropertyAnimation, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QDrag, QFont, QPixmap
+from PySide6.QtCore import (
+    QByteArray,
+    QEasingCurve,
+    QMimeData,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QColor, QCursor, QDrag, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -34,7 +52,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QRadioButton,
     QRubberBand,
     QScrollArea,
     QVBoxLayout,
@@ -45,17 +65,32 @@ import win_icons
 from app_config import (
     DEFAULT_SIZE,
     SIZE_PRESETS,
+    SORT_MODES,
+    THEMES,
     USER_DATA_DIR,
     expand_path,
     get_app_version,
     get_theme,
+    is_startup_enabled,
     load_settings,
     load_shortcuts,
     load_trash,
     new_item_id,
     portabilize_path,
+    purge_old_trash,
+    save_settings,
     save_shortcuts,
     save_trash,
+    set_startup_enabled,
+    startup_supported,
+)
+from github_updates import (
+    UpdateError,
+    UpdateInfo,
+    apply_update,
+    check_for_updates,
+    cleanup_stale_update_files,
+    restart_with_update,
 )
 
 # Tipo MIME propio para arrastrar tarjetas dentro de la app (reordenar,
@@ -87,6 +122,18 @@ def pil_to_pixmap(image) -> QPixmap:
     pixmap = QPixmap()
     pixmap.loadFromData(buffer.getvalue(), "PNG")
     return pixmap
+
+
+def color_swatch_icon(hex_color: str, size: int = 12) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor(hex_color))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(0, 0, size, size, 3, 3)
+    painter.end()
+    return QIcon(pixmap)
 
 
 # ---------------------------------------------------------------------------
@@ -176,18 +223,27 @@ class FlowLayout(QLayout):
 class TileWidget(QFrame):
     context_requested = Signal(dict, object)
     clicked_with_modifiers = Signal(dict, object)
+    double_clicked = Signal(dict)
     drag_started = Signal(dict)
     drop_received = Signal(dict, list, str)  # (target_item, dragged_ids, side)
     files_dropped_here = Signal(dict, list)  # (target_item, local_paths)
 
-    def __init__(self, item: dict, colors: dict, sibling_items: list[dict]) -> None:
+    def __init__(
+        self, item: dict, colors: dict, sibling_items: list[dict],
+        categories: dict | None = None, compact: bool = False,
+    ) -> None:
         super().__init__()
         self.item = item
         self.colors = colors
+        self.compact = compact
+        categories = categories or {}
         preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
 
         self.setObjectName("tile")
-        self.setFixedSize(preset["width"], preset["height"])
+        if compact:
+            self.setFixedSize(max(preset["width"], 220), 40)
+        else:
+            self.setFixedSize(preset["width"], preset["height"])
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setAcceptDrops(True)
         self._selected = False
@@ -201,7 +257,58 @@ class TileWidget(QFrame):
         )
         self._is_broken = is_broken
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        category_color = categories.get(item.get("category") or "")
+        if category_color:
+            stripe = QFrame()
+            stripe.setFixedHeight(4)
+            stripe.setStyleSheet(f"background: {category_color}; border: none;")
+            outer.addWidget(stripe)
+
+        content = QWidget()
+        outer.addWidget(content, stretch=1)
+        icon_px = 22 if compact else (40 if preset["width"] >= 200 else (32 if preset["width"] >= 150 else 26))
+        pixmap = self._load_icon(sibling_items, icon_px)
+
+        # La sombra se crea siempre (antes solo se creaba en modo tarjeta,
+        # y como enterEvent/leaveEvent la usan sin comprobar, pasar el
+        # ratón por una fila en modo compacto petaba con AttributeError).
+        self._shadow = QGraphicsDropShadowEffect(self)
+        self._shadow.setBlurRadius(10 if compact else 18)
+        self._shadow.setOffset(0, 2 if compact else 3)
+        self._shadow.setColor(QColor(0, 0, 0, 70 if compact else 90))
+        self.setGraphicsEffect(self._shadow)
+        self._shadow_anim = QPropertyAnimation(self._shadow, b"blurRadius")
+        self._shadow_anim.setDuration(150)
+        self._shadow_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._hover_blur = 16 if compact else 28
+        self._base_blur = 10 if compact else 18
+
+        if compact:
+            layout = QHBoxLayout(content)
+            layout.setContentsMargins(10, 4, 10, 4)
+            layout.setSpacing(8)
+
+            icon_label = QLabel()
+            icon_label.setFixedSize(icon_px + 4, icon_px + 4)
+            icon_label.setAlignment(Qt.AlignCenter)
+            if pixmap is not None:
+                icon_label.setPixmap(pixmap)
+            else:
+                icon_label.setText("⚠️" if is_broken else ("📁" if item["type"] == "folder" else "📄"))
+                icon_label.setFont(QFont("Segoe UI Emoji", 12))
+            layout.addWidget(icon_label)
+
+            name_label = QLabel(item["name"])
+            name_label.setObjectName("tileName")
+            name_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            layout.addWidget(name_label, stretch=1)
+            return
+
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(10, 12, 10, 10)
         layout.setSpacing(2)
         layout.setAlignment(Qt.AlignHCenter)
@@ -209,7 +316,6 @@ class TileWidget(QFrame):
         icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignCenter)
         icon_label.setFixedHeight(36)
-        pixmap = self._load_icon(sibling_items)
         if pixmap is not None:
             icon_label.setPixmap(pixmap)
         else:
@@ -233,23 +339,7 @@ class TileWidget(QFrame):
 
         layout.addStretch()
 
-        # Sombra suave: esto es exactamente lo que en Tkinter no se podía
-        # hacer sin recurrir a trucos con imágenes — aquí es una línea.
-        self._shadow = QGraphicsDropShadowEffect(self)
-        self._shadow.setBlurRadius(18)
-        self._shadow.setOffset(0, 3)
-        self._shadow.setColor(QColor(0, 0, 0, 90))
-        self.setGraphicsEffect(self._shadow)
-
-        # Animación sutil de "elevación" al pasar el ratón por encima.
-        self._shadow_anim = QPropertyAnimation(self._shadow, b"blurRadius")
-        self._shadow_anim.setDuration(150)
-        self._shadow_anim.setEasingCurve(QEasingCurve.OutCubic)
-
-    def _load_icon(self, sibling_items: list[dict]):
-        preset = SIZE_PRESETS.get(self.item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
-        icon_px = 40 if preset["width"] >= 200 else (32 if preset["width"] >= 150 else 26)
-
+    def _load_icon(self, sibling_items: list[dict], icon_px: int):
         if self.item["type"] == "folder":
             children = [it for it in sibling_items if it["parent_id"] == self.item["id"]]
             preview_paths = [c.get("path") for c in children if c["type"] == "shortcut"][:3]
@@ -284,14 +374,14 @@ class TileWidget(QFrame):
     def enterEvent(self, event) -> None:
         self._shadow_anim.stop()
         self._shadow_anim.setStartValue(self._shadow.blurRadius())
-        self._shadow_anim.setEndValue(28)
+        self._shadow_anim.setEndValue(self._hover_blur)
         self._shadow_anim.start()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._shadow_anim.stop()
         self._shadow_anim.setStartValue(self._shadow.blurRadius())
-        self._shadow_anim.setEndValue(18)
+        self._shadow_anim.setEndValue(self._base_blur)
         self._shadow_anim.start()
         super().leaveEvent(event)
 
@@ -323,6 +413,11 @@ class TileWidget(QFrame):
         if event.button() == Qt.LeftButton and inside and not was_dragging:
             self.clicked_with_modifiers.emit(self.item, event.modifiers())
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.double_clicked.emit(self.item)
+        super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:
         self.context_requested.emit(self.item, event.globalPos())
@@ -426,6 +521,105 @@ class GridContainer(QWidget):
                 event.acceptProposedAction()
 
 
+# ---------------------------------------------------------------------------
+# Actualizaciones: la comprobación (HTTP a la API de GitHub) y la descarga
+# se hacen en un hilo aparte para no congelar la ventana. Las señales de
+# QThread se entregan automáticamente en el hilo principal, así que es
+# seguro tocar la interfaz desde los slots que las reciben.
+# ---------------------------------------------------------------------------
+
+
+class UpdateCheckWorker(QThread):
+    result_ready = Signal(object)  # UpdateInfo | None
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            info = check_for_updates()
+        except UpdateError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 — cualquier fallo de red, mostrarlo igual
+            self.failed.emit(str(exc))
+        else:
+            self.result_ready.emit(info)
+
+
+class UpdateInstallWorker(QThread):
+    progress = Signal(int, int)  # (bytes descargados, bytes totales)
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, update: UpdateInfo) -> None:
+        super().__init__()
+        self.update = update
+
+    def run(self) -> None:
+        try:
+            apply_update(
+                self.update.download_url,
+                latest_version=self.update.latest_version,
+                progress_callback=lambda done, total: self.progress.emit(done, total),
+            )
+        except UpdateError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        else:
+            self.finished_ok.emit()
+
+
+class UpdateProgressDialog(QDialog):
+    def __init__(self, parent, colors: dict) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Actualizando")
+        self.setModal(True)
+        self.setFixedSize(360, 130)
+        self.setWindowFlag(Qt.WindowCloseButtonHint, False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        self.status_label = QLabel("Descargando actualización...")
+        layout.addWidget(self.status_label)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        layout.addWidget(self.bar)
+
+        self.eta_label = QLabel("")
+        self.eta_label.setStyleSheet(f"color: {colors['text_muted']}; font-size: 10px;")
+        layout.addWidget(self.eta_label)
+
+        self._start_time = time.time()
+
+    def update_progress(self, downloaded: int, total: int) -> None:
+        if total > 0:
+            pct = int(downloaded * 100 / total)
+            self.bar.setRange(0, 100)
+            self.bar.setValue(pct)
+            elapsed = time.time() - self._start_time
+            speed = downloaded / elapsed if elapsed > 0 else 0
+            remaining_bytes = max(total - downloaded, 0)
+            eta_seconds = remaining_bytes / speed if speed > 0 else 0
+            mb_done = downloaded / 1_048_576
+            mb_total = total / 1_048_576
+            self.eta_label.setText(
+                f"{mb_done:.1f} / {mb_total:.1f} MB — {self._format_eta(eta_seconds)} restante"
+            )
+        else:
+            # El servidor no mandó Content-Length: barra indeterminada.
+            self.bar.setRange(0, 0)
+            mb_done = downloaded / 1_048_576
+            self.eta_label.setText(f"{mb_done:.1f} MB descargados")
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        return f"{minutes}m {secs}s"
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -434,6 +628,13 @@ class MainWindow(QMainWindow):
         self.shortcuts = load_shortcuts()
         self.current_folder_id: str | None = None
         self.breadcrumb: list[tuple[str, str | None]] = [("Inicio", None)]
+        self.category_filter: str | None = None  # None=todas, ""=sin categoría, o el nombre
+
+        # Purga la papelera de lo que ya lleve más de la cuenta ahí dentro.
+        trash = load_trash()
+        trash, changed = purge_old_trash(trash)
+        if changed:
+            save_trash(trash)
 
         self.selected_ids: set[str] = set()
         self._last_clicked_id: str | None = None
@@ -446,10 +647,38 @@ class MainWindow(QMainWindow):
         self.resize(820, 600)
         self.setMinimumSize(480, 360)
         self.setFocusPolicy(Qt.StrongFocus)
+        geometry = self.settings.get("window_geometry", "")
+        if geometry:
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
+            except Exception:
+                pass
 
         self._build_ui()
         self._apply_theme()
         self.refresh()
+
+        # -- actualizaciones --------------------------------------------
+        cleanup_stale_update_files()
+        self._update_check_thread: UpdateCheckWorker | None = None
+        self._update_install_thread: UpdateInstallWorker | None = None
+        self._update_progress_dialog: UpdateProgressDialog | None = None
+        self._pending_update: UpdateInfo | None = None
+        self.update_icon.mousePressEvent = lambda _e: self.check_updates_dialog(manual=True)
+        if self.settings.get("auto_check_updates", True):
+            QTimer.singleShot(2500, lambda: self.check_updates_dialog(manual=False))
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(lambda: self.check_updates_dialog(manual=False))
+        self._update_timer.start(15 * 60 * 1000)
+
+    def closeEvent(self, event) -> None:
+        try:
+            geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            self.settings["window_geometry"] = geometry
+            save_settings(self.settings)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # -- construcción --------------------------------------------------
 
@@ -475,7 +704,7 @@ class MainWindow(QMainWindow):
         self.update_icon = QLabel("🔄")
         self.update_icon.setObjectName("updateIcon")
         self.update_icon.setCursor(QCursor(Qt.PointingHandCursor))
-        self.update_icon.setToolTip("Buscar actualizaciones (próximamente)")
+        self.update_icon.setToolTip("Buscar actualizaciones")
         header_row.addWidget(self.update_icon)
         root_layout.addLayout(header_row)
 
@@ -505,8 +734,43 @@ class MainWindow(QMainWindow):
         self.back_button = back_button
 
         toolbar_row.addStretch()
+
+        self.sort_button = QPushButton()
+        self.sort_button.setObjectName("ghostButton")
+        self.sort_button.setCursor(QCursor(Qt.PointingHandCursor))
+        self.sort_button.clicked.connect(self.show_sort_menu)
+        toolbar_row.addWidget(self.sort_button)
+
+        self.view_button = QPushButton()
+        self.view_button.setObjectName("ghostButton")
+        self.view_button.setCursor(QCursor(Qt.PointingHandCursor))
+        self.view_button.clicked.connect(self.toggle_view_style)
+        toolbar_row.addWidget(self.view_button)
+
+        self.category_button = QPushButton("🏷  Categorías")
+        self.category_button.setObjectName("ghostButton")
+        self.category_button.setCursor(QCursor(Qt.PointingHandCursor))
+        self.category_button.clicked.connect(self.show_category_menu)
+        toolbar_row.addWidget(self.category_button)
+
+        trash_button = QPushButton("🗑")
+        trash_button.setObjectName("ghostButton")
+        trash_button.setCursor(QCursor(Qt.PointingHandCursor))
+        trash_button.setToolTip("Papelera")
+        trash_button.clicked.connect(self.open_trash_dialog)
+        toolbar_row.addWidget(trash_button)
+
+        settings_button = QPushButton("⚙")
+        settings_button.setObjectName("ghostButton")
+        settings_button.setCursor(QCursor(Qt.PointingHandCursor))
+        settings_button.setToolTip("Configuración")
+        settings_button.clicked.connect(self.open_settings_dialog)
+        toolbar_row.addWidget(settings_button)
+
         root_layout.addLayout(toolbar_row)
         root_layout.addSpacing(10)
+        self._update_sort_button_text()
+        self._update_view_button_text()
 
         # -- cuadrícula de tarjetas, dentro de un área con scroll --
         self.scroll_area = QScrollArea()
@@ -516,8 +780,13 @@ class MainWindow(QMainWindow):
 
         self.grid_container = GridContainer(self)
         self.grid_container.setObjectName("gridContainer")
-        self.flow_layout = FlowLayout(self.grid_container, margin=4, spacing=14)
-        self.grid_container.setLayout(self.flow_layout)
+        # Un QVBoxLayout de "secciones": normalmente hay una sola sección sin
+        # título con todas las tarjetas, pero al agrupar por categoría hay
+        # una sección (con encabezado) por categoría, cada una con su propio
+        # FlowLayout interno.
+        self._sections_layout = QVBoxLayout(self.grid_container)
+        self._sections_layout.setContentsMargins(4, 4, 4, 4)
+        self._sections_layout.setSpacing(20)
 
         self.scroll_area.setWidget(self.grid_container)
         root_layout.addWidget(self.scroll_area, stretch=1)
@@ -569,6 +838,9 @@ class MainWindow(QMainWindow):
             QFrame#tile[selected="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
             QLabel#tileName {{ color: {c['text']}; font-size: 12px; font-weight: 600; font-family: 'Segoe UI'; }}
             QLabel#tileSubtitle {{ color: {c['text_muted']}; font-size: 9px; }}
+            QLabel#sectionHeader {{
+                color: {c['text_muted']}; font-size: 11px; font-weight: 700; padding-bottom: 2px;
+            }}
 
             QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
             QScrollBar::handle:vertical {{ background: {c['surface_hover']}; border-radius: 5px; min-height: 24px; }}
@@ -577,41 +849,110 @@ class MainWindow(QMainWindow):
 
     # -- datos / navegación ----------------------------------------------
 
+    def _sort_items(self, items: list[dict]) -> list[dict]:
+        mode = self.settings.get("sort_mode", "manual")
+        if mode == "name_asc":
+            return sorted(items, key=lambda it: it["name"].casefold())
+        if mode == "name_desc":
+            return sorted(items, key=lambda it: it["name"].casefold(), reverse=True)
+        if mode == "folders_first":
+            return sorted(
+                items, key=lambda it: (0 if it["type"] == "folder" else 1, it.get("order", 0))
+            )
+        return sorted(items, key=lambda it: it.get("order", 0))
+
     def _visible_items(self) -> list[dict]:
         items = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
-        return sorted(items, key=lambda it: it.get("order", 0))
+        if self.category_filter is not None:
+            if self.category_filter == "":
+                items = [it for it in items if not it.get("category")]
+            else:
+                items = [it for it in items if it.get("category") == self.category_filter]
+        return self._sort_items(items)
+
+    def _grouped_items(self) -> list[tuple[str, list[dict]]]:
+        base = self._sort_items(
+            [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
+        )
+        groups: list[tuple[str, list[dict]]] = []
+        for name in self.settings.get("categories", {}):
+            group = [it for it in base if it.get("category") == name]
+            if group:
+                groups.append((name, group))
+        uncategorized = [it for it in base if not it.get("category")]
+        if uncategorized:
+            groups.append(("Sin categoría", uncategorized))
+        return groups
 
     def _render_breadcrumb(self) -> None:
         self.breadcrumb_label.setText("  ›  ".join(name for name, _ in self.breadcrumb))
         self.back_button.setEnabled(self.current_folder_id is not None)
 
     def refresh(self) -> None:
-        while self.flow_layout.count():
-            item = self.flow_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        while self._sections_layout.count():
+            layout_item = self._sections_layout.takeAt(0)
+            if layout_item.widget() is not None:
+                layout_item.widget().deleteLater()
 
-        items = self._visible_items()
         self._render_breadcrumb()
-        self.selected_ids &= {it["id"] for it in items}
         self._tiles = []
         self._tile_by_id = {}
+        compact = self.settings.get("card_style") == "compact"
+        grouped = bool(self.settings.get("group_by_category")) and self.category_filter is None
 
-        if not items:
-            self.flow_layout.addWidget(self.empty_label)
-            return
+        if grouped:
+            groups = self._grouped_items()
+            all_ids = {it["id"] for _, items in groups for it in items}
+            self.selected_ids &= all_ids
+            if not groups:
+                self._sections_layout.addWidget(self.empty_label)
+            else:
+                for label, items in groups:
+                    self._add_section(label, items, compact)
+        else:
+            items = self._visible_items()
+            self.selected_ids &= {it["id"] for it in items}
+            if not items:
+                self._sections_layout.addWidget(self.empty_label)
+            else:
+                self._add_section(None, items, compact)
 
+        self._sections_layout.addStretch(1)
+
+    def _add_section(self, label: str | None, items: list[dict], compact: bool) -> None:
+        section = QWidget()
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(8)
+
+        if label is not None:
+            color = self.settings.get("categories", {}).get(label)
+            header = QLabel(f"{label}   ·   {len(items)}")
+            header.setObjectName("sectionHeader")
+            if color:
+                header.setStyleSheet(f"color: {color}; font-weight: 700; font-size: 11px;")
+            section_layout.addWidget(header)
+
+        flow_widget = QWidget()
+        flow = FlowLayout(flow_widget, margin=0, spacing=14)
+        flow_widget.setLayout(flow)
+        section_layout.addWidget(flow_widget)
+
+        categories = self.settings.get("categories", {})
         for item in items:
-            tile = TileWidget(item, self.colors, self.shortcuts)
+            tile = TileWidget(item, self.colors, self.shortcuts, categories=categories, compact=compact)
             tile.clicked_with_modifiers.connect(self.handle_tile_click)
+            tile.double_clicked.connect(self.open_item)
             tile.context_requested.connect(self.show_context_menu)
             tile.drag_started.connect(self.begin_drag)
             tile.drop_received.connect(self.handle_internal_drop)
             tile.files_dropped_here.connect(self.handle_external_drop)
             tile.set_selected(item["id"] in self.selected_ids)
-            self.flow_layout.addWidget(tile)
+            flow.addWidget(tile)
             self._tiles.append(tile)
             self._tile_by_id[item["id"]] = tile
+
+        self._sections_layout.addWidget(section)
 
     # -- acciones ----------------------------------------------------
 
@@ -619,6 +960,7 @@ class MainWindow(QMainWindow):
         if item["type"] == "folder":
             self.breadcrumb.append((item["name"], item["id"]))
             self.current_folder_id = item["id"]
+            self.category_filter = None
             self.selected_ids = set()
             self.refresh()
             return
@@ -647,10 +989,11 @@ class MainWindow(QMainWindow):
             self.selected_ids = set(ordered_ids[lo:hi + 1])
             self._refresh_selection_visuals()
         else:
-            self.selected_ids = set()
+            self.selected_ids = {item["id"]}
             self._last_clicked_id = item["id"]
             self._refresh_selection_visuals()
-            self.open_item(item)
+            if self.settings.get("click_mode", "double") == "single":
+                self.open_item(item)
 
     def _refresh_selection_visuals(self) -> None:
         for tile in self._tiles:
@@ -664,7 +1007,17 @@ class MainWindow(QMainWindow):
             self._refresh_selection_visuals()
 
     def update_marquee(self, rect: QRect) -> None:
-        hit = {t.item["id"] for t in self._tiles if t.geometry().intersects(rect)}
+        # Las tarjetas pueden estar anidadas dentro de una sección (vista
+        # agrupada por categoría), así que su `.geometry()` es relativa a
+        # ESA sección, no al contenedor general — hay que traducir cada
+        # tarjeta a coordenadas de `grid_container` con mapTo() para que
+        # el cálculo de intersección sea correcto pase lo que pase.
+        hit = set()
+        for tile in self._tiles:
+            top_left = tile.mapTo(self.grid_container, QPoint(0, 0))
+            tile_rect = QRect(top_left, tile.size())
+            if tile_rect.intersects(rect):
+                hit.add(tile.item["id"])
         base = self._marquee_base_selection or set()
         self.selected_ids = base | hit
         self._refresh_selection_visuals()
@@ -922,6 +1275,82 @@ class MainWindow(QMainWindow):
         })
         save_shortcuts(self.shortcuts)
         self.refresh()
+
+    # -- actualizaciones ---------------------------------------------------
+
+    def check_updates_dialog(self, manual: bool) -> None:
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            return  # ya hay una comprobación en marcha
+        self._manual_check = manual
+        self.update_icon.setToolTip("Buscando actualizaciones...")
+        self.update_icon.setText("⏳")
+        thread = UpdateCheckWorker()
+        thread.result_ready.connect(self._on_update_check_result)
+        thread.failed.connect(self._on_update_check_failed)
+        thread.finished.connect(thread.deleteLater)
+        self._update_check_thread = thread
+        thread.start()
+
+    def _on_update_check_result(self, update: UpdateInfo | None) -> None:
+        self.update_icon.setText("🔄")
+        self.update_icon.setToolTip("Buscar actualizaciones")
+        self._update_check_thread = None
+        if update is None:
+            if self._manual_check:
+                QMessageBox.information(self, "Actualizaciones", "Ya tienes la última versión instalada.")
+            return
+        self._pending_update = update
+        self.update_icon.setText("🟢")
+        self.update_icon.setToolTip(f"Hay una versión nueva disponible: {update.latest_version}")
+        self._prompt_install(update)
+
+    def _on_update_check_failed(self, message: str) -> None:
+        self.update_icon.setText("🔄")
+        self.update_icon.setToolTip("Buscar actualizaciones")
+        self._update_check_thread = None
+        if self._manual_check:
+            QMessageBox.warning(self, "No se pudo comprobar", message)
+
+    def _prompt_install(self, update: UpdateInfo) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Actualización disponible",
+            f"Hay una versión nueva: {update.latest_version} (tienes {update.current_version}).\n\n"
+            "¿Descargarla e instalarla ahora? La app se cerrará un momento y se abrirá "
+            "sola cuando termine.",
+        )
+        if answer == QMessageBox.Yes:
+            self._start_install(update)
+
+    def _start_install(self, update: UpdateInfo) -> None:
+        dialog = UpdateProgressDialog(self, self.colors)
+        self._update_progress_dialog = dialog
+
+        thread = UpdateInstallWorker(update)
+        thread.progress.connect(dialog.update_progress)
+        thread.finished_ok.connect(self._on_install_finished)
+        thread.failed.connect(self._on_install_failed)
+        thread.finished.connect(thread.deleteLater)
+        self._update_install_thread = thread
+        thread.start()
+        dialog.exec()
+
+    def _on_install_finished(self) -> None:
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.status_label.setText("¡Listo! Reiniciando...")
+            self._update_progress_dialog.eta_label.setText("")
+        QTimer.singleShot(600, self._relaunch_with_update)
+
+    def _relaunch_with_update(self) -> None:
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.accept()
+        restart_with_update(self)
+
+    def _on_install_failed(self, message: str) -> None:
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.reject()
+            self._update_progress_dialog = None
+        QMessageBox.warning(self, "Error al actualizar", message)
 
 
 def main() -> None:
