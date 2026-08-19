@@ -83,6 +83,7 @@ from app_config import (
     save_trash,
     set_startup_enabled,
     startup_supported,
+    TRASH_RETENTION_DAYS,
 )
 from github_updates import (
     UpdateError,
@@ -497,6 +498,10 @@ class GridContainer(QWidget):
             self._window.end_marquee()
         super().mouseReleaseEvent(event)
 
+    def resizeEvent(self, event) -> None:
+        self._window._relayout_sections()
+        super().resizeEvent(event)
+
     def dragEnterEvent(self, event) -> None:
         md = event.mimeData()
         if md.hasFormat(MIME_ITEM_IDS) or md.hasUrls():
@@ -641,6 +646,7 @@ class MainWindow(QMainWindow):
         self._marquee_base_selection: set[str] | None = None
         self._tiles: list[TileWidget] = []
         self._tile_by_id: dict[str, TileWidget] = {}
+        self._flow_sections: list = []
         self._focus_index: int = -1
 
         self.setWindowTitle("Accesos Directos")
@@ -897,6 +903,7 @@ class MainWindow(QMainWindow):
         self._render_breadcrumb()
         self._tiles = []
         self._tile_by_id = {}
+        self._flow_sections = []
         compact = self.settings.get("card_style") == "compact"
         grouped = bool(self.settings.get("group_by_category")) and self.category_filter is None
 
@@ -918,6 +925,7 @@ class MainWindow(QMainWindow):
                 self._add_section(None, items, compact)
 
         self._sections_layout.addStretch(1)
+        self._relayout_sections()
 
     def _add_section(self, label: str | None, items: list[dict], compact: bool) -> None:
         section = QWidget()
@@ -953,6 +961,22 @@ class MainWindow(QMainWindow):
             self._tile_by_id[item["id"]] = tile
 
         self._sections_layout.addWidget(section)
+        self._flow_sections.append((flow_widget, flow))
+
+    def _relayout_sections(self) -> None:
+        # Qt no propaga bien "altura según ancho" (heightForWidth) a través
+        # de varios niveles de layouts anidados (aquí: secciones dentro de
+        # _sections_layout, y dentro de cada sección un FlowLayout propio)
+        # — es una limitación conocida de Qt, no un descuido. Por eso se
+        # calcula la altura de cada sección a mano y se fija explícitamente
+        # en vez de confiar en que el sistema de layouts la adivine sola;
+        # si no, las secciones acaban solapándose unas con otras.
+        width = self.scroll_area.viewport().width()
+        if width <= 0:
+            return
+        for flow_widget, flow in self._flow_sections:
+            needed_height = flow._do_layout(width, apply=False)
+            flow_widget.setFixedHeight(needed_height)
 
     # -- acciones ----------------------------------------------------
 
@@ -1152,6 +1176,7 @@ class MainWindow(QMainWindow):
         self.breadcrumb.pop()
         self.current_folder_id = self.breadcrumb[-1][1]
         self.selected_ids = set()
+        self.category_filter = None
         self.refresh()
 
     def show_context_menu(self, item: dict, global_pos) -> None:
@@ -1166,10 +1191,58 @@ class MainWindow(QMainWindow):
             menu.addAction("Abrir", lambda: self.open_item(item))
             menu.addSeparator()
             menu.addAction("Renombrar...", lambda: self.rename_item(item))
+        menu.addMenu(self._build_category_assignment_menu(selected_items or [item]))
+        menu.addMenu(self._build_size_menu(selected_items or [item]))
+        menu.addSeparator()
+        if len(selected_items) <= 1:
             menu.addAction("Quitar", lambda: self._delete_items([item]))
         else:
             menu.addAction(f"Quitar {len(selected_items)} elementos", lambda: self._delete_items(selected_items))
         menu.exec(global_pos)
+
+    def _build_category_assignment_menu(self, items: list[dict]) -> QMenu:
+        menu = QMenu("Categoría", self)
+        menu.addAction("Sin categoría", lambda: self._assign_category(items, None))
+        categories = self.settings.get("categories", {})
+        if categories:
+            menu.addSeparator()
+            for name, color in categories.items():
+                menu.addAction(color_swatch_icon(color), name, lambda n=name: self._assign_category(items, n))
+        menu.addSeparator()
+        menu.addAction("Nueva categoría...", lambda: self._create_category_and_assign(items))
+        return menu
+
+    def _build_size_menu(self, items: list[dict]) -> QMenu:
+        menu = QMenu("Tamaño", self)
+        for key, preset in SIZE_PRESETS.items():
+            menu.addAction(preset["label"], lambda k=key: self._assign_size(items, k))
+        return menu
+
+    def _assign_category(self, items: list[dict], name: str | None) -> None:
+        for item in items:
+            item["category"] = name
+        save_shortcuts(self.shortcuts)
+        self.refresh()
+
+    def _assign_size(self, items: list[dict], size: str) -> None:
+        for item in items:
+            item["size"] = size
+        save_shortcuts(self.shortcuts)
+        self.refresh()
+
+    def _create_category_and_assign(self, items: list[dict]) -> None:
+        name, ok = QInputDialog.getText(self, "Nueva categoría", "Nombre:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        color = QColorDialog.getColor(QColor(self.colors["accent"]), self, "Color de la categoría")
+        if not color.isValid():
+            return
+        categories = dict(self.settings.get("categories", {}))
+        categories[name] = color.name()
+        self.settings["categories"] = categories
+        save_settings(self.settings)
+        self._assign_category(items, name)
 
     def rename_item(self, item: dict) -> None:
         name, ok = QInputDialog.getText(self, "Renombrar", "Nuevo nombre:", text=item["name"])
@@ -1275,6 +1348,377 @@ class MainWindow(QMainWindow):
         })
         save_shortcuts(self.shortcuts)
         self.refresh()
+
+    # -- orden / vista / categorías / configuración / papelera ----------
+
+    SORT_LABELS = {
+        "manual": "Manual (arrastrar)",
+        "name_asc": "Nombre A-Z",
+        "name_desc": "Nombre Z-A",
+        "folders_first": "Carpetas primero",
+    }
+
+    def _update_sort_button_text(self) -> None:
+        mode = self.settings.get("sort_mode", "manual")
+        self.sort_button.setText("↕  " + self.SORT_LABELS.get(mode, "Orden"))
+
+    def show_sort_menu(self) -> None:
+        menu = QMenu(self)
+        current = self.settings.get("sort_mode", "manual")
+        for key in SORT_MODES:
+            action = menu.addAction(self.SORT_LABELS[key], lambda k=key: self._set_sort_mode(k))
+            action.setCheckable(True)
+            action.setChecked(key == current)
+        menu.exec(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
+
+    def _set_sort_mode(self, mode: str) -> None:
+        self.settings["sort_mode"] = mode
+        save_settings(self.settings)
+        self._update_sort_button_text()
+        self.refresh()
+
+    def _update_view_button_text(self) -> None:
+        compact = self.settings.get("card_style") == "compact"
+        self.view_button.setText("▦  Tarjetas" if compact else "☰  Compacta")
+        self.view_button.setToolTip("Cambiar a vista de tarjetas" if compact else "Cambiar a vista compacta")
+
+    def toggle_view_style(self) -> None:
+        compact = self.settings.get("card_style") == "compact"
+        self.settings["card_style"] = "cards" if compact else "compact"
+        save_settings(self.settings)
+        self._update_view_button_text()
+        self.refresh()
+
+    def show_category_menu(self) -> None:
+        menu = QMenu(self)
+        all_action = menu.addAction("Todas las categorías", lambda: self._set_category_filter(None))
+        all_action.setCheckable(True)
+        all_action.setChecked(self.category_filter is None and not self.settings.get("group_by_category"))
+
+        none_action = menu.addAction("Sin categoría", lambda: self._set_category_filter(""))
+        none_action.setCheckable(True)
+        none_action.setChecked(self.category_filter == "")
+
+        categories = self.settings.get("categories", {})
+        if categories:
+            menu.addSeparator()
+            for name, color in categories.items():
+                action = menu.addAction(
+                    color_swatch_icon(color), name, lambda n=name: self._set_category_filter(n)
+                )
+                action.setCheckable(True)
+                action.setChecked(self.category_filter == name)
+
+        menu.addSeparator()
+        group_action = menu.addAction("Agrupar por categoría", self._toggle_group_by_category)
+        group_action.setCheckable(True)
+        group_action.setChecked(bool(self.settings.get("group_by_category")))
+
+        menu.addSeparator()
+        menu.addAction("Gestionar categorías...", self.open_manage_categories_dialog)
+        menu.exec(self.category_button.mapToGlobal(self.category_button.rect().bottomLeft()))
+
+    def _set_category_filter(self, value: str | None) -> None:
+        self.category_filter = value
+        if value is not None and self.settings.get("group_by_category"):
+            self.settings["group_by_category"] = False
+            save_settings(self.settings)
+        self.refresh()
+
+    def _toggle_group_by_category(self) -> None:
+        self.settings["group_by_category"] = not self.settings.get("group_by_category")
+        if self.settings["group_by_category"]:
+            self.category_filter = None
+        save_settings(self.settings)
+        self.refresh()
+
+    def open_manage_categories_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Gestionar categorías")
+        dialog.resize(360, 320)
+        layout = QVBoxLayout(dialog)
+
+        rows_container = QWidget()
+        rows_layout = QVBoxLayout(rows_container)
+
+        def render_rows() -> None:
+            while rows_layout.count():
+                item = rows_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            categories = self.settings.get("categories", {})
+            if not categories:
+                rows_layout.addWidget(QLabel("Todavía no hay categorías."))
+            for name, color in list(categories.items()):
+                row = QHBoxLayout()
+                swatch = QLabel()
+                swatch.setFixedSize(14, 14)
+                swatch.setStyleSheet(f"background: {color}; border-radius: 4px;")
+                row.addWidget(swatch)
+                row.addWidget(QLabel(name), stretch=1)
+                rename_btn = QPushButton("Renombrar")
+                rename_btn.clicked.connect(lambda _c=False, n=name: rename_category(n))
+                row.addWidget(rename_btn)
+                recolor_btn = QPushButton("Color")
+                recolor_btn.clicked.connect(lambda _c=False, n=name: recolor_category(n))
+                row.addWidget(recolor_btn)
+                delete_btn = QPushButton("Borrar")
+                delete_btn.clicked.connect(lambda _c=False, n=name: delete_category(n))
+                row.addWidget(delete_btn)
+                rows_layout.addLayout(row)
+
+        def rename_category(old_name: str) -> None:
+            new_name, ok = QInputDialog.getText(dialog, "Renombrar categoría", "Nombre:", text=old_name)
+            new_name = new_name.strip()
+            if not ok or not new_name or new_name == old_name:
+                return
+            categories = dict(self.settings.get("categories", {}))
+            categories[new_name] = categories.pop(old_name)
+            self.settings["categories"] = categories
+            for it in self.shortcuts:
+                if it.get("category") == old_name:
+                    it["category"] = new_name
+            save_settings(self.settings)
+            save_shortcuts(self.shortcuts)
+            render_rows()
+            self.refresh()
+
+        def recolor_category(name: str) -> None:
+            categories = dict(self.settings.get("categories", {}))
+            color = QColorDialog.getColor(QColor(categories.get(name, "#38bdf8")), dialog)
+            if not color.isValid():
+                return
+            categories[name] = color.name()
+            self.settings["categories"] = categories
+            save_settings(self.settings)
+            render_rows()
+            self.refresh()
+
+        def delete_category(name: str) -> None:
+            confirm = QMessageBox.question(
+                dialog, "Borrar categoría",
+                f"¿Borrar la categoría «{name}»? Los accesos que la tengan se quedarán sin categoría.",
+            )
+            if confirm != QMessageBox.Yes:
+                return
+            categories = dict(self.settings.get("categories", {}))
+            categories.pop(name, None)
+            self.settings["categories"] = categories
+            for it in self.shortcuts:
+                if it.get("category") == name:
+                    it["category"] = None
+            if self.category_filter == name:
+                self.category_filter = None
+            save_settings(self.settings)
+            save_shortcuts(self.shortcuts)
+            render_rows()
+            self.refresh()
+
+        render_rows()
+        layout.addWidget(rows_container)
+        layout.addStretch()
+
+        new_row = QHBoxLayout()
+        new_button = QPushButton("+ Nueva categoría...")
+
+        def create_new() -> None:
+            name, ok = QInputDialog.getText(dialog, "Nueva categoría", "Nombre:")
+            name = name.strip()
+            if not ok or not name:
+                return
+            color = QColorDialog.getColor(QColor(self.colors["accent"]), dialog)
+            if not color.isValid():
+                return
+            categories = dict(self.settings.get("categories", {}))
+            categories[name] = color.name()
+            self.settings["categories"] = categories
+            save_settings(self.settings)
+            render_rows()
+
+        new_button.clicked.connect(create_new)
+        new_row.addWidget(new_button)
+        layout.addLayout(new_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.close)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def open_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Configuración")
+        dialog.resize(340, 380)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("Tema"))
+        theme_combo = QComboBox()
+        theme_keys = list(THEMES.keys())
+        for key in theme_keys:
+            theme_combo.addItem(THEMES[key]["label"], key)
+        theme_combo.setCurrentIndex(theme_keys.index(self.settings.get("theme", "morado")))
+        layout.addWidget(theme_combo)
+
+        layout.addWidget(QLabel("Clics para abrir un acceso"))
+        click_group = QButtonGroup(dialog)
+        single_radio = QRadioButton("Un clic")
+        double_radio = QRadioButton("Doble clic")
+        click_group.addButton(single_radio)
+        click_group.addButton(double_radio)
+        if self.settings.get("click_mode", "double") == "single":
+            single_radio.setChecked(True)
+        else:
+            double_radio.setChecked(True)
+        layout.addWidget(single_radio)
+        layout.addWidget(double_radio)
+
+        auto_update_check = QCheckBox("Buscar actualizaciones automáticamente")
+        auto_update_check.setChecked(bool(self.settings.get("auto_check_updates", True)))
+        layout.addWidget(auto_update_check)
+
+        startup_check = None
+        if startup_supported():
+            startup_check = QCheckBox("Iniciar con Windows")
+            startup_check.setChecked(is_startup_enabled())
+            layout.addWidget(startup_check)
+
+        cache_row = QHBoxLayout()
+        cache_size = win_icons.disk_cache_size_bytes()
+        cache_label = QLabel(f"Caché de iconos en disco: {cache_size / 1024:.0f} KB")
+        cache_row.addWidget(cache_label)
+        cache_row.addStretch()
+        clear_cache_button = QPushButton("Vaciar caché de iconos")
+
+        def clear_icon_cache() -> None:
+            size_before = win_icons.disk_cache_size_bytes()
+            win_icons.clear_disk_cache()
+            if size_before:
+                cache_label.setText("Caché de iconos en disco: 0 KB")
+                QMessageBox.information(
+                    dialog, "Caché de iconos", f"Se han liberado {size_before / 1024:.0f} KB."
+                )
+            else:
+                QMessageBox.information(dialog, "Caché de iconos", "La caché ya estaba vacía.")
+
+        clear_cache_button.clicked.connect(clear_icon_cache)
+        cache_row.addWidget(clear_cache_button)
+        layout.addLayout(cache_row)
+
+        layout.addStretch()
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def save_and_close() -> None:
+            theme_key = theme_combo.currentData()
+            theme_changed = theme_key != self.settings.get("theme")
+            self.settings["theme"] = theme_key
+            self.settings["click_mode"] = "single" if single_radio.isChecked() else "double"
+            self.settings["auto_check_updates"] = auto_update_check.isChecked()
+            if startup_check is not None:
+                set_startup_enabled(startup_check.isChecked())
+            save_settings(self.settings)
+            if theme_changed:
+                self.colors = get_theme(theme_key)
+                self._apply_theme()
+            self.refresh()
+            dialog.accept()
+
+        buttons.accepted.connect(save_and_close)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec()
+
+    def open_trash_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Papelera")
+        dialog.resize(420, 420)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"Los elementos se eliminan definitivamente a los {TRASH_RETENTION_DAYS} días de estar aquí."
+        ))
+
+        rows_container = QWidget()
+        rows_layout = QVBoxLayout(rows_container)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(rows_container)
+        layout.addWidget(scroll, stretch=1)
+
+        def render_rows() -> None:
+            while rows_layout.count():
+                item = rows_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            trash = load_trash()
+            if not trash:
+                rows_layout.addWidget(QLabel("La papelera está vacía."))
+                return
+            trash.sort(key=lambda it: it.get("deleted_at", 0), reverse=True)
+            for entry in trash:
+                row = QHBoxLayout()
+                icon = "📁" if entry["type"] == "folder" else "📄"
+                row.addWidget(QLabel(f"{icon} {entry['name']}"), stretch=1)
+                restore_btn = QPushButton("Restaurar")
+                restore_btn.clicked.connect(lambda _c=False, e=entry: restore_entry(e))
+                row.addWidget(restore_btn)
+                delete_btn = QPushButton("Eliminar ya")
+                delete_btn.clicked.connect(lambda _c=False, e=entry: delete_forever(e))
+                row.addWidget(delete_btn)
+                rows_layout.addLayout(row)
+            rows_layout.addStretch()
+
+        def restore_entry(entry: dict) -> None:
+            trash = load_trash()
+            trash = [it for it in trash if it["id"] != entry["id"]]
+            restored = dict(entry)
+            restored.pop("deleted_at", None)
+            valid_ids = {it["id"] for it in self.shortcuts}
+            if restored.get("parent_id") not in valid_ids:
+                restored["parent_id"] = None
+            self.shortcuts.append(restored)
+            save_shortcuts(self.shortcuts)
+            save_trash(trash)
+            render_rows()
+            self.refresh()
+
+        def delete_forever(entry: dict) -> None:
+            confirm = QMessageBox.question(
+                dialog, "Eliminar definitivamente",
+                f"¿Eliminar «{entry['name']}» para siempre? No se puede deshacer.",
+            )
+            if confirm != QMessageBox.Yes:
+                return
+            trash = load_trash()
+            trash = [it for it in trash if it["id"] != entry["id"]]
+            save_trash(trash)
+            render_rows()
+
+        render_rows()
+
+        buttons_row = QHBoxLayout()
+        empty_button = QPushButton("Vaciar papelera")
+
+        def empty_trash() -> None:
+            trash = load_trash()
+            if not trash:
+                return
+            confirm = QMessageBox.question(
+                dialog, "Vaciar papelera",
+                f"¿Eliminar definitivamente los {len(trash)} elementos de la papelera?",
+            )
+            if confirm != QMessageBox.Yes:
+                return
+            save_trash([])
+            render_rows()
+
+        empty_button.clicked.connect(empty_trash)
+        buttons_row.addWidget(empty_button)
+        buttons_row.addStretch()
+        close_button = QPushButton("Cerrar")
+        close_button.clicked.connect(dialog.close)
+        buttons_row.addWidget(close_button)
+        layout.addLayout(buttons_row)
+
+        dialog.exec()
 
     # -- actualizaciones ---------------------------------------------------
 
