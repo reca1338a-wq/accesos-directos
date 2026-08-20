@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLayout,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -226,6 +227,7 @@ class TileWidget(QFrame):
     clicked_with_modifiers = Signal(dict, object)
     double_clicked = Signal(dict)
     drag_started = Signal(dict)
+    drag_hover = Signal(dict, str)  # (target_item, "before"|"after"|"into"|"")
     drop_received = Signal(dict, list, str)  # (target_item, dragged_ids, side)
     files_dropped_here = Signal(dict, list)  # (target_item, local_paths)
 
@@ -372,6 +374,11 @@ class TileWidget(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
 
+    def set_drop_highlight(self, value: bool) -> None:
+        self.setProperty("dropTarget", "true" if value else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
     def enterEvent(self, event) -> None:
         self._shadow_anim.stop()
         self._shadow_anim.setStartValue(self._shadow.blurRadius())
@@ -425,16 +432,37 @@ class TileWidget(QFrame):
 
     # -- soltar (reordenar / mover a carpeta / arrastrar desde el Explorador) --
 
+    def _drop_zone(self, x: int) -> str:
+        """"before"/"after" (insertar junto a esta tarjeta) o "into" (meter
+        dentro, solo si es una carpeta y el cursor está en su zona central:
+        el 20% de cada borde sigue sirviendo para reordenar la propia
+        carpeta entre sus hermanas, en vez de forzar siempre "meter dentro")."""
+        ratio = x / max(self.width(), 1)
+        if self.item["type"] == "folder" and 0.2 <= ratio <= 0.8:
+            return "into"
+        return "before" if ratio < 0.5 else "after"
+
     def dragEnterEvent(self, event) -> None:
         md = event.mimeData()
         if md.hasFormat(MIME_ITEM_IDS) or md.hasUrls():
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event) -> None:
+        md = event.mimeData()
+        x = event.position().toPoint().x()
+        if md.hasFormat(MIME_ITEM_IDS):
+            self.drag_hover.emit(self.item, self._drop_zone(x))
+        elif md.hasUrls():
+            self.drag_hover.emit(self.item, "into" if self.item["type"] == "folder" else "after")
         event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:
+        self.drag_hover.emit(self.item, "")
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:
         md = event.mimeData()
+        self.drag_hover.emit(self.item, "")
         if md.hasFormat(MIME_ITEM_IDS):
             try:
                 ids = json.loads(bytes(md.data(MIME_ITEM_IDS)).decode("utf-8"))
@@ -442,11 +470,7 @@ class TileWidget(QFrame):
                 return
             if self.item["id"] in ids:
                 return
-            x = event.position().toPoint().x()
-            if self.item["type"] == "folder":
-                side = "into"
-            else:
-                side = "before" if x < self.width() / 2 else "after"
+            side = self._drop_zone(event.position().toPoint().x())
             self.drop_received.emit(self.item, ids, side)
             event.acceptProposedAction()
         elif md.hasUrls():
@@ -508,6 +532,7 @@ class GridContainer(QWidget):
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event) -> None:
+        self._window.update_drop_indicator(None, "")
         event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:
@@ -797,6 +822,14 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidget(self.grid_container)
         root_layout.addWidget(self.scroll_area, stretch=1)
 
+        # Línea de inserción: se muestra/mueve durante el arrastre para
+        # dejar claro dónde va a caer la tarjeta, en vez de tener que
+        # soltar "a ciegas" para descubrirlo.
+        self._drop_indicator = QFrame(self.grid_container)
+        self._drop_indicator.setObjectName("dropIndicator")
+        self._drop_indicator.hide()
+        self._drop_highlight_id: str | None = None
+
         self.empty_label = QLabel("Esta carpeta está vacía.\nUsa «+ Añadir» para empezar.")
         self.empty_label.setObjectName("emptyLabel")
         self.empty_label.setAlignment(Qt.AlignCenter)
@@ -842,6 +875,8 @@ class MainWindow(QMainWindow):
             }}
             QFrame#tile:hover {{ background: {c['surface_hover']}; border: 1px solid {c['accent']}; }}
             QFrame#tile[selected="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
+            QFrame#tile[dropTarget="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
+            QFrame#dropIndicator {{ background: {c['accent']}; border-radius: 2px; }}
             QLabel#tileName {{ color: {c['text']}; font-size: 12px; font-weight: 600; font-family: 'Segoe UI'; }}
             QLabel#tileSubtitle {{ color: {c['text_muted']}; font-size: 9px; }}
             QLabel#sectionHeader {{
@@ -954,6 +989,7 @@ class MainWindow(QMainWindow):
             tile.double_clicked.connect(self.open_item)
             tile.context_requested.connect(self.show_context_menu)
             tile.drag_started.connect(self.begin_drag)
+            tile.drag_hover.connect(self.update_drop_indicator)
             tile.drop_received.connect(self.handle_internal_drop)
             tile.files_dropped_here.connect(self.handle_external_drop)
             tile.set_selected(item["id"] in self.selected_ids)
@@ -1055,6 +1091,40 @@ class MainWindow(QMainWindow):
         self._refresh_selection_visuals()
 
     # -- arrastrar y soltar ----------------------------------------------
+
+    def update_drop_indicator(self, target_item: dict | None, mode: str) -> None:
+        if not mode:
+            self._drop_indicator.hide()
+            self._clear_drop_highlight()
+            return
+
+        tile = self._tile_by_id.get(target_item["id"]) if target_item else None
+        if tile is None:
+            self._drop_indicator.hide()
+            self._clear_drop_highlight()
+            return
+
+        if mode == "into":
+            self._drop_indicator.hide()
+            if self._drop_highlight_id != target_item["id"]:
+                self._clear_drop_highlight()
+                tile.set_drop_highlight(True)
+                self._drop_highlight_id = target_item["id"]
+            return
+
+        self._clear_drop_highlight()
+        top_left = tile.mapTo(self.grid_container, QPoint(0, 0))
+        x = top_left.x() - 2 if mode == "before" else top_left.x() + tile.width() - 2
+        self._drop_indicator.setGeometry(x, top_left.y(), 4, tile.height())
+        self._drop_indicator.show()
+        self._drop_indicator.raise_()
+
+    def _clear_drop_highlight(self) -> None:
+        if self._drop_highlight_id is not None:
+            tile = self._tile_by_id.get(self._drop_highlight_id)
+            if tile is not None:
+                tile.set_drop_highlight(False)
+            self._drop_highlight_id = None
 
     def begin_drag(self, item: dict) -> None:
         tile = self._tile_by_id.get(item["id"])
