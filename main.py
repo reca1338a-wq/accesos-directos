@@ -898,6 +898,7 @@ class MainWindow(QMainWindow):
         while self._sections_layout.count():
             layout_item = self._sections_layout.takeAt(0)
             if layout_item.widget() is not None:
+                layout_item.widget().hide()
                 layout_item.widget().deleteLater()
 
         self._render_breadcrumb()
@@ -1444,13 +1445,16 @@ class MainWindow(QMainWindow):
         def render_rows() -> None:
             while rows_layout.count():
                 item = rows_layout.takeAt(0)
-                if item.widget():
+                if item.widget() is not None:
+                    item.widget().hide()
                     item.widget().deleteLater()
             categories = self.settings.get("categories", {})
             if not categories:
                 rows_layout.addWidget(QLabel("Todavía no hay categorías."))
             for name, color in list(categories.items()):
-                row = QHBoxLayout()
+                row_widget = QWidget()
+                row = QHBoxLayout(row_widget)
+                row.setContentsMargins(0, 0, 0, 0)
                 swatch = QLabel()
                 swatch.setFixedSize(14, 14)
                 swatch.setStyleSheet(f"background: {color}; border-radius: 4px;")
@@ -1465,7 +1469,7 @@ class MainWindow(QMainWindow):
                 delete_btn = QPushButton("Borrar")
                 delete_btn.clicked.connect(lambda _c=False, n=name: delete_category(n))
                 row.addWidget(delete_btn)
-                rows_layout.addLayout(row)
+                rows_layout.addWidget(row_widget)
 
         def rename_category(old_name: str) -> None:
             new_name, ok = QInputDialog.getText(dialog, "Renombrar categoría", "Nombre:", text=old_name)
@@ -1646,7 +1650,8 @@ class MainWindow(QMainWindow):
         def render_rows() -> None:
             while rows_layout.count():
                 item = rows_layout.takeAt(0)
-                if item.widget():
+                if item.widget() is not None:
+                    item.widget().hide()
                     item.widget().deleteLater()
             trash = load_trash()
             if not trash:
@@ -1654,7 +1659,9 @@ class MainWindow(QMainWindow):
                 return
             trash.sort(key=lambda it: it.get("deleted_at", 0), reverse=True)
             for entry in trash:
-                row = QHBoxLayout()
+                row_widget = QWidget()
+                row = QHBoxLayout(row_widget)
+                row.setContentsMargins(0, 0, 0, 0)
                 icon = "📁" if entry["type"] == "folder" else "📄"
                 row.addWidget(QLabel(f"{icon} {entry['name']}"), stretch=1)
                 restore_btn = QPushButton("Restaurar")
@@ -1663,7 +1670,7 @@ class MainWindow(QMainWindow):
                 delete_btn = QPushButton("Eliminar ya")
                 delete_btn.clicked.connect(lambda _c=False, e=entry: delete_forever(e))
                 row.addWidget(delete_btn)
-                rows_layout.addLayout(row)
+                rows_layout.addWidget(row_widget)
             rows_layout.addStretch()
 
         def restore_entry(entry: dict) -> None:
