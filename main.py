@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -65,17 +66,20 @@ from PySide6.QtWidgets import (
 
 import win_icons
 from app_config import (
+    DEFAULT_PATH_DISPLAY,
     DEFAULT_SIZE,
     GRID_SNAP_STEP,
     MAX_TILE_HEIGHT,
     MAX_TILE_WIDTH,
     MIN_TILE_HEIGHT,
     MIN_TILE_WIDTH,
+    PATH_DISPLAY_MODES,
     SIZE_PRESETS,
     SORT_MODES,
     THEMES,
     USER_DATA_DIR,
     expand_path,
+    favorite_items,
     get_app_version,
     get_theme,
     is_startup_enabled,
@@ -232,6 +236,22 @@ class FlowLayout(QLayout):
 # ---------------------------------------------------------------------------
 
 
+class _StarLabel(QLabel):
+    """QLabel clicable: la estrella de favorito de cada tarjeta. Un
+    QLabel normal no tiene señal de clic propia, así que se añade aquí
+    lo mínimo necesario sin tocar el resto de la lógica de ratón de
+    TileWidget (que vive en el propio QFrame, no en sus hijos)."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class TileWidget(QFrame):
     context_requested = Signal(dict, object)
     clicked_with_modifiers = Signal(dict, object)
@@ -242,16 +262,25 @@ class TileWidget(QFrame):
     files_dropped_here = Signal(dict, list)  # (target_item, local_paths)
     resize_moved = Signal(dict, int, int)  # (item, new_width, new_height) — mientras se arrastra
     resize_finished = Signal(dict, int, int)  # (item, new_width, new_height) — al soltar
+    favorite_toggled = Signal(dict)  # (item) — al pulsar la estrella
 
     def __init__(
         self, item: dict, colors: dict, sibling_items: list[dict],
         categories: dict | None = None, compact: bool = False, subtitle_override: str | None = None,
+        path_display_mode: str = DEFAULT_PATH_DISPLAY,
     ) -> None:
         super().__init__()
         self.item = item
         self.colors = colors
         self.compact = compact
         self.subtitle_override = subtitle_override
+        self._path_display_mode = (
+            path_display_mode if path_display_mode in PATH_DISPLAY_MODES else DEFAULT_PATH_DISPLAY
+        )
+        self._is_favorite = bool(item.get("favorite", False))
+        self._hovering = False
+        self._subtitle_label: QLabel | None = None
+        self._favorite_label: _StarLabel | None = None
         categories = categories or {}
         preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
         # Un tamaño personalizado (arrastrando la esquina, ver _resize_handle_rect)
@@ -335,6 +364,8 @@ class TileWidget(QFrame):
             name_label.setObjectName("tileName")
             name_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             layout.addWidget(name_label, stretch=1)
+            self._build_favorite_star(size=14)
+            self._update_favorite_visual()
             return
 
         layout = QVBoxLayout(content)
@@ -358,13 +389,25 @@ class TileWidget(QFrame):
         name_label.setWordWrap(True)
         layout.addWidget(name_label)
 
-        subtitle = self._subtitle(sibling_items)
-        if subtitle:
-            subtitle_label = QLabel(subtitle)
+        # Se crea siempre que haga falta poder revelarla más tarde (por
+        # ejemplo cuando el modo es "solo si está seleccionado"), aunque
+        # empiece vacía/oculta — así no hay que reconstruir la tarjeta al
+        # seleccionarla, basta con cambiar el texto de esta misma etiqueta.
+        needs_subtitle_widget = (
+            self.subtitle_override is not None
+            or self.item["type"] == "folder"
+            or self._is_broken
+            or self._path_display_mode in ("always", "on_select")
+        )
+        if needs_subtitle_widget:
+            subtitle_text = self._subtitle(sibling_items)
+            subtitle_label = QLabel(subtitle_text)
             subtitle_label.setObjectName("tileSubtitle")
             subtitle_label.setAlignment(Qt.AlignCenter)
             subtitle_label.setWordWrap(True)
+            subtitle_label.setVisible(bool(subtitle_text))
             layout.addWidget(subtitle_label)
+            self._subtitle_label = subtitle_label
 
         layout.addStretch()
 
@@ -377,6 +420,9 @@ class TileWidget(QFrame):
         self._grip_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._position_grip()
 
+        self._build_favorite_star(size=18)
+        self._update_favorite_visual()
+
     def _position_grip(self) -> None:
         if getattr(self, "_grip_label", None) is None:
             return
@@ -384,8 +430,50 @@ class TileWidget(QFrame):
             self.width() - self._resize_grip - 2, self.height() - self._resize_grip - 2
         )
 
+    def _build_favorite_star(self, size: int) -> None:
+        """Estrellita flotante en la esquina superior derecha de la
+        tarjeta para marcar/desmarcar favoritos. Es hija directa de la
+        tarjeta (no del layout de contenido) para poder posicionarla a
+        mano encima de todo, igual que `_grip_label`."""
+        self._favorite_size = size
+        star = _StarLabel(self)
+        star.setObjectName("favoriteStar")
+        star.setAlignment(Qt.AlignCenter)
+        star.setFixedSize(size, size)
+        star.setCursor(QCursor(Qt.PointingHandCursor))
+        star.setToolTip("Quitar de favoritos" if self._is_favorite else "Marcar como favorito")
+        star.clicked.connect(self._on_favorite_clicked)
+        self._favorite_label = star
+        self._position_favorite_star()
+
+    def _position_favorite_star(self) -> None:
+        if self._favorite_label is None:
+            return
+        size = self._favorite_size
+        self._favorite_label.move(self.width() - size - 4, 4)
+
+    def _on_favorite_clicked(self) -> None:
+        self._is_favorite = not self._is_favorite
+        self.item["favorite"] = self._is_favorite
+        self._update_favorite_visual()
+        self.favorite_toggled.emit(self.item)
+
+    def _update_favorite_visual(self) -> None:
+        if self._favorite_label is None:
+            return
+        self._favorite_label.setText("★" if self._is_favorite else "☆")
+        self._favorite_label.setToolTip(
+            "Quitar de favoritos" if self._is_favorite else "Marcar como favorito"
+        )
+        self._favorite_label.setProperty("active", "true" if self._is_favorite else "false")
+        self._favorite_label.style().unpolish(self._favorite_label)
+        self._favorite_label.style().polish(self._favorite_label)
+        visible = self._is_favorite or self._hovering or self._selected
+        self._favorite_label.setVisible(visible)
+
     def resizeEvent(self, event) -> None:
         self._position_grip()
+        self._position_favorite_star()
         super().resizeEvent(event)
 
     def _in_resize_zone(self, pos: QPoint) -> bool:
@@ -411,6 +499,13 @@ class TileWidget(QFrame):
         image = win_icons.get_icon_image(expand_path(self.item.get("path", "")), icon_px)
         return pil_to_pixmap(image) if image is not None else None
 
+    def _path_text(self) -> str:
+        """Ruta original ya acortada (con `~` para la carpeta personal),
+        sin tener en cuenta el modo de visualización elegido en ajustes."""
+        home = str(Path.home())
+        path = self.item.get("path", "")
+        return "~" + path[len(home):] if path.startswith(home) else path
+
     def _subtitle(self, sibling_items: list[dict]) -> str:
         if self.subtitle_override is not None:
             return self.subtitle_override
@@ -419,9 +514,11 @@ class TileWidget(QFrame):
             return f"{count} elemento" + ("" if count == 1 else "s")
         if self._is_broken:
             return "⚠ No se encuentra"
-        home = str(Path.home())
-        path = self.item.get("path", "")
-        return "~" + path[len(home):] if path.startswith(home) else path
+        if self._path_display_mode == "never":
+            return ""
+        if self._path_display_mode == "on_select":
+            return self._path_text() if self._selected else ""
+        return self._path_text()
 
     def set_selected(self, value: bool) -> None:
         if self._selected == value:
@@ -430,6 +527,19 @@ class TileWidget(QFrame):
         self.setProperty("selected", "true" if value else "false")
         self.style().unpolish(self)
         self.style().polish(self)
+        self._update_favorite_visual()
+        # Modo "solo si está seleccionado": la ruta se revela/oculta al
+        # (des)seleccionar la tarjeta, sin reconstruirla entera.
+        if (
+            self._subtitle_label is not None
+            and self.subtitle_override is None
+            and self.item["type"] != "folder"
+            and not self._is_broken
+            and self._path_display_mode == "on_select"
+        ):
+            text = self._path_text() if value else ""
+            self._subtitle_label.setText(text)
+            self._subtitle_label.setVisible(bool(text))
 
     def set_drop_highlight(self, value: bool) -> None:
         self.setProperty("dropTarget", "true" if value else "false")
@@ -437,6 +547,8 @@ class TileWidget(QFrame):
         self.style().polish(self)
 
     def enterEvent(self, event) -> None:
+        self._hovering = True
+        self._update_favorite_visual()
         self._shadow_anim.stop()
         self._shadow_anim.setStartValue(self._shadow.blurRadius())
         self._shadow_anim.setEndValue(self._hover_blur)
@@ -444,6 +556,8 @@ class TileWidget(QFrame):
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self._hovering = False
+        self._update_favorite_visual()
         self._shadow_anim.stop()
         self._shadow_anim.setStartValue(self._shadow.blurRadius())
         self._shadow_anim.setEndValue(self._base_blur)
@@ -901,6 +1015,13 @@ class MainWindow(QMainWindow):
         stats_button.clicked.connect(self.open_usage_stats_dialog)
         toolbar_row2.addWidget(stats_button)
 
+        favorites_button = QPushButton("⭐  Favoritos")
+        favorites_button.setObjectName("ghostButton")
+        favorites_button.setCursor(QCursor(Qt.PointingHandCursor))
+        favorites_button.setToolTip("Accesos y carpetas marcados como favoritos")
+        favorites_button.clicked.connect(self.open_favorites_dialog)
+        toolbar_row2.addWidget(favorites_button)
+
         toolbar_row2.addStretch()
 
         trash_button = QPushButton("🗑")
@@ -957,6 +1078,45 @@ class MainWindow(QMainWindow):
         footer.setObjectName("footer")
         footer.setWordWrap(True)
         root_layout.addWidget(footer)
+
+        # Aviso flotante ("toast") que se desvanece solo, por ejemplo al
+        # marcar/desmarcar un favorito. Flota encima de todo lo demás
+        # (hijo directo de `central`, no de ningún layout), y se
+        # reposiciona a mano cada vez que se muestra.
+        self._toast_label = QLabel("", central)
+        self._toast_label.setObjectName("toastLabel")
+        self._toast_label.setAlignment(Qt.AlignCenter)
+        self._toast_label.hide()
+        self._toast_opacity = QGraphicsOpacityEffect(self._toast_label)
+        self._toast_opacity.setOpacity(1.0)
+        self._toast_label.setGraphicsEffect(self._toast_opacity)
+        self._toast_anim = QPropertyAnimation(self._toast_opacity, b"opacity")
+        self._toast_anim.finished.connect(self._toast_label.hide)
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._fade_out_toast)
+
+    def _show_toast(self, text: str) -> None:
+        self._toast_timer.stop()
+        self._toast_anim.stop()
+        self._toast_label.setText(text)
+        self._toast_label.adjustSize()
+        central = self.centralWidget()
+        x = (central.width() - self._toast_label.width()) // 2
+        y = central.height() - self._toast_label.height() - 24
+        self._toast_label.move(max(0, x), max(0, y))
+        self._toast_opacity.setOpacity(1.0)
+        self._toast_label.show()
+        self._toast_label.raise_()
+        self._toast_timer.start(1800)
+
+    def _fade_out_toast(self) -> None:
+        self._toast_anim.stop()
+        self._toast_anim.setDuration(500)
+        self._toast_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._toast_anim.setStartValue(1.0)
+        self._toast_anim.setEndValue(0.0)
+        self._toast_anim.start()
 
     def _apply_theme(self) -> None:
         c = self.colors
@@ -1019,6 +1179,19 @@ class MainWindow(QMainWindow):
             QLabel#tileSubtitle {{ color: {c['text_muted']}; font-size: 9px; }}
             QLabel#sectionHeader {{
                 color: {c['text_muted']}; font-size: 11px; font-weight: 700; padding-bottom: 2px;
+            }}
+            QLabel#favoriteStar {{
+                color: {c['text_muted']}; font-size: 13px; background: transparent;
+            }}
+            QLabel#favoriteStar[active="true"] {{ color: #f5c518; }}
+            QPushButton#favoriteStarButton {{
+                color: #f5c518; background: transparent; border: none;
+                font-size: 14px; padding: 4px 8px;
+            }}
+            QPushButton#favoriteStarButton:hover {{ background: {c['surface_hover']}; border-radius: 6px; }}
+            QLabel#toastLabel {{
+                background: {c['accent']}; color: {c['bg']}; font-weight: 700;
+                font-size: 12px; border-radius: 10px; padding: 8px 16px;
             }}
 
             QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
@@ -1183,11 +1356,12 @@ class MainWindow(QMainWindow):
         section_layout.addWidget(flow_widget)
 
         categories = self.settings.get("categories", {})
+        path_display_mode = self.settings.get("path_display", DEFAULT_PATH_DISPLAY)
         for item in items:
             subtitle_override = path_map.get(item["id"]) if path_map else None
             tile = TileWidget(
                 item, self.colors, self.shortcuts, categories=categories, compact=compact,
-                subtitle_override=subtitle_override,
+                subtitle_override=subtitle_override, path_display_mode=path_display_mode,
             )
             tile.clicked_with_modifiers.connect(self.handle_tile_click)
             tile.double_clicked.connect(self.open_item)
@@ -1198,6 +1372,7 @@ class MainWindow(QMainWindow):
             tile.files_dropped_here.connect(self.handle_external_drop)
             tile.resize_moved.connect(self.handle_tile_resize_moved)
             tile.resize_finished.connect(self.handle_tile_resize_finished)
+            tile.favorite_toggled.connect(self.handle_favorite_toggle)
             tile.set_selected(item["id"] in self.selected_ids)
             flow.addWidget(tile)
             self._tiles.append(tile)
@@ -1722,6 +1897,87 @@ class MainWindow(QMainWindow):
         save_shortcuts(self.shortcuts)
         self.refresh()
 
+    # -- favoritos --------------------------------------------------------
+
+    def handle_favorite_toggle(self, item: dict) -> None:
+        # `item` es la misma referencia que vive dentro de self.shortcuts
+        # (las tarjetas se construyen a partir de esa lista sin copiarla),
+        # así que la propia TileWidget ya ha actualizado item["favorite"];
+        # aquí solo hace falta persistir el cambio y avisar al usuario.
+        save_shortcuts(self.shortcuts)
+        if item.get("favorite"):
+            self._show_toast("★ Añadido a favoritos")
+        else:
+            self._show_toast("☆ Quitado de favoritos")
+
+    def open_favorites_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Favoritos")
+        dialog.resize(380, 420)
+        layout = QVBoxLayout(dialog)
+
+        favorites = favorite_items(self.shortcuts)
+        if not favorites:
+            layout.addWidget(QLabel(
+                "Todavía no tienes favoritos.\n"
+                "Pulsa la ☆ de cualquier tarjeta (al pasar el ratón o "
+                "seleccionarla) para añadirla aquí."
+            ))
+        else:
+            rows_container = QWidget()
+            rows_layout = QVBoxLayout(rows_container)
+            rows_layout.setContentsMargins(0, 0, 0, 0)
+
+            def build_rows() -> None:
+                while rows_layout.count():
+                    layout_item = rows_layout.takeAt(0)
+                    if layout_item.widget() is not None:
+                        layout_item.widget().deleteLater()
+                for item in favorite_items(self.shortcuts):
+                    row_widget = QWidget()
+                    row = QHBoxLayout(row_widget)
+                    row.setContentsMargins(0, 2, 0, 2)
+
+                    icon = "📁" if item["type"] == "folder" else "📄"
+                    open_button = QPushButton(f"{icon}  {item['name']}")
+                    open_button.setObjectName("ghostButton")
+                    open_button.setCursor(QCursor(Qt.PointingHandCursor))
+                    open_button.clicked.connect(lambda _c=False, it=item: (dialog.accept(), self.open_item(it)))
+                    row.addWidget(open_button, stretch=1)
+
+                    unfav_button = QPushButton("★")
+                    unfav_button.setObjectName("favoriteStarButton")
+                    unfav_button.setToolTip("Quitar de favoritos")
+                    unfav_button.setCursor(QCursor(Qt.PointingHandCursor))
+
+                    def unfavorite(_c=False, item_id=item["id"]) -> None:
+                        for it in self.shortcuts:
+                            if it["id"] == item_id:
+                                it["favorite"] = False
+                                break
+                        save_shortcuts(self.shortcuts)
+                        tile = self._tile_by_id.get(item_id)
+                        if tile is not None:
+                            tile._is_favorite = False
+                            tile._update_favorite_visual()
+                        build_rows()
+
+                    unfav_button.clicked.connect(unfavorite)
+                    row.addWidget(unfav_button)
+                    rows_layout.addWidget(row_widget)
+
+            build_rows()
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(rows_container)
+            layout.addWidget(scroll, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.close)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.exec()
+
     # -- estadísticas de uso --------------------------------------------------
 
     def open_usage_stats_dialog(self) -> None:
@@ -2108,6 +2364,22 @@ class MainWindow(QMainWindow):
         snap_check.setChecked(bool(self.settings.get("snap_to_grid", True)))
         layout.addWidget(snap_check)
 
+        layout.addWidget(QLabel("Mostrar la ruta original en cada acceso"))
+        path_group = QButtonGroup(dialog)
+        path_always_radio = QRadioButton("Mostrar siempre (como ahora)")
+        path_select_radio = QRadioButton("Solo en los accesos seleccionados")
+        path_never_radio = QRadioButton("No mostrarla nunca")
+        for radio in (path_always_radio, path_select_radio, path_never_radio):
+            path_group.addButton(radio)
+            layout.addWidget(radio)
+        current_path_display = self.settings.get("path_display", DEFAULT_PATH_DISPLAY)
+        if current_path_display == "never":
+            path_never_radio.setChecked(True)
+        elif current_path_display == "on_select":
+            path_select_radio.setChecked(True)
+        else:
+            path_always_radio.setChecked(True)
+
         startup_check = None
         if startup_supported():
             startup_check = QCheckBox("Iniciar con Windows")
@@ -2147,6 +2419,12 @@ class MainWindow(QMainWindow):
             self.settings["click_mode"] = "single" if single_radio.isChecked() else "double"
             self.settings["auto_check_updates"] = auto_update_check.isChecked()
             self.settings["snap_to_grid"] = snap_check.isChecked()
+            if path_never_radio.isChecked():
+                self.settings["path_display"] = "never"
+            elif path_select_radio.isChecked():
+                self.settings["path_display"] = "on_select"
+            else:
+                self.settings["path_display"] = "always"
             if startup_check is not None:
                 set_startup_enabled(startup_check.isChecked())
             save_settings(self.settings)

@@ -4,7 +4,8 @@ Obtiene el mismo icono que Windows muestra para un archivo, carpeta o
 programa (el de la aplicación predeterminada asociada a esa extensión —
 por ejemplo HeidiSQL para un .sql, o el navegador por defecto para un
 .html — el icono del propio .exe, el de carpeta, etc.) y lo convierte en
-un ImageTk.PhotoImage listo para usar en una tarjeta de Tkinter.
+una imagen PIL (RGBA) lista para transformarse en QPixmap y usarse en
+una tarjeta de PySide6.
 
 Deliberadamente NO usa pywin32: llama directamente a la API de Windows
 (shell32/user32/gdi32) con `ctypes`, que forma parte de la librería
@@ -175,9 +176,10 @@ def get_icon_photo(path: str, size: int = 32):
 
     Nota histórica: en la versión antigua (Tkinter) esta función
     devolvía un ImageTk.PhotoImage; con PySide6 lo que se necesita es un
-    QPixmap, y esa conversión la hace `main.pil_to_pixmap` a partir de la
-    imagen PIL. Se mantiene el nombre por compatibilidad, pero ahora es
-    un simple alias de `get_icon_image` con su propia caché en memoria."""
+    QPixmap, y esa conversión la hace `main.pil_to_pixmap` a partir de
+    esta misma imagen PIL. Se mantiene el nombre por compatibilidad,
+    pero ahora es un simple alias de `get_icon_image` con su propia
+    caché en memoria."""
     if not path:
         return None
 

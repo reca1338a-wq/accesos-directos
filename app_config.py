@@ -94,6 +94,12 @@ DEFAULT_SIZE = "medium"
 
 SORT_MODES = ("manual", "name_asc", "name_desc", "folders_first")
 
+# Cuándo mostrar la ruta original debajo de cada acceso directo:
+# "always" (como hasta ahora), "never" (nunca) o "on_select" (solo en los
+# accesos seleccionados en cada momento).
+PATH_DISPLAY_MODES = ("always", "never", "on_select")
+DEFAULT_PATH_DISPLAY = "always"
+
 # Tamaño mínimo/máximo (en píxeles) al redimensionar una tarjeta a mano
 # arrastrando su esquina (estilo Power BI / Canva), y el paso de la
 # rejilla a la que se ajusta el tamaño cuando "snap_to_grid" está activo.
@@ -115,6 +121,8 @@ DEFAULT_SETTINGS = {
     # tamaño resultante a múltiplos de GRID_SNAP_STEP para que tarjetas de
     # tamaños distintos sigan quedando alineadas entre sí de forma pulcra.
     "snap_to_grid": True,
+    # Ver PATH_DISPLAY_MODES arriba.
+    "path_display": DEFAULT_PATH_DISPLAY,
 }
 
 DEFAULT_SHORTCUTS = [
@@ -181,6 +189,14 @@ def most_used_items(items: list[dict], limit: int = 10) -> list[dict]:
     return used[:limit]
 
 
+def favorite_items(items: list[dict]) -> list[dict]:
+    """Devuelve los accesos y carpetas marcados como favoritos, ordenados
+    alfabéticamente por nombre."""
+    favorites = [it for it in items if it.get("favorite")]
+    favorites.sort(key=lambda it: it["name"].casefold())
+    return favorites
+
+
 def ensure_user_data_dir() -> None:
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -213,6 +229,8 @@ def load_settings() -> dict:
     geometry = data.get("window_geometry", "")
     merged["window_geometry"] = str(geometry) if isinstance(geometry, str) else ""
     merged["snap_to_grid"] = bool(data.get("snap_to_grid", DEFAULT_SETTINGS["snap_to_grid"]))
+    path_display = data.get("path_display", DEFAULT_PATH_DISPLAY)
+    merged["path_display"] = path_display if path_display in PATH_DISPLAY_MODES else DEFAULT_PATH_DISPLAY
     categories = data.get("categories", {})
     merged["categories"] = (
         {str(k): str(v) for k, v in categories.items()} if isinstance(categories, dict) else {}
@@ -411,6 +429,7 @@ def _normalize_items(raw: list) -> list[dict]:
             "category": category,
             "open_count": open_count,
             "last_opened": last_opened,
+            "favorite": bool(entry.get("favorite", False)),
         }
 
         if item_type == "shortcut":
