@@ -3,6 +3,7 @@
 
 PySide6>=6.6.0                          # Interfaz gráfica (Qt). Imprescindible: sin esto la app no arranca.
 Pillow>=10.0.0                          # Iconos reales de Windows y miniaturas de imagen.
+PyMuPDF>=1.24.0                         # Miniatura real de la 1ª página de los PDF (opcional: sin esto, PDF usa el icono normal).
 
 # Nota: los iconos de Windows ya NO usan pywin32 (daba muchos problemas de
 # empaquetado con PyInstaller). Se piden directamente con ctypes, que ya

@@ -94,6 +94,13 @@ DEFAULT_SIZE = "medium"
 
 SORT_MODES = ("manual", "name_asc", "name_desc", "folders_first")
 
+# Tamaño mínimo/máximo (en píxeles) al redimensionar una tarjeta a mano
+# arrastrando su esquina (estilo Power BI / Canva), y el paso de la
+# rejilla a la que se ajusta el tamaño cuando "snap_to_grid" está activo.
+MIN_TILE_WIDTH, MAX_TILE_WIDTH = 90, 360
+MIN_TILE_HEIGHT, MAX_TILE_HEIGHT = 70, 280
+GRID_SNAP_STEP = 10
+
 DEFAULT_SETTINGS = {
     "auto_check_updates": True,
     "click_mode": "double",  # "single" o "double"
@@ -104,6 +111,10 @@ DEFAULT_SETTINGS = {
     "categories": {},  # nombre -> color hex, ej. {"Trabajo": "#38bdf8"}
     "group_by_category": False,
     "window_geometry": "",  # "WxH+X+Y", como devuelve root.geometry(); vacío = usar el tamaño por defecto
+    # Al redimensionar tarjetas a mano (arrastrando la esquina), ajusta el
+    # tamaño resultante a múltiplos de GRID_SNAP_STEP para que tarjetas de
+    # tamaños distintos sigan quedando alineadas entre sí de forma pulcra.
+    "snap_to_grid": True,
 }
 
 DEFAULT_SHORTCUTS = [
@@ -137,6 +148,39 @@ def new_item_id() -> str:
     return str(_uuid.uuid4())
 
 
+def snap_dimension(value: int, step: int = GRID_SNAP_STEP) -> int:
+    """Redondea `value` al múltiplo de `step` más cercano (mínimo `step`).
+    Se usa al redimensionar tarjetas a mano para que el resultado quede
+    "en rejilla" en vez de a un píxel exacto arbitrario."""
+    if step <= 0:
+        return value
+    snapped = round(value / step) * step
+    return max(step, snapped)
+
+
+def record_item_opened(items: list[dict], item_id: str) -> None:
+    """Actualiza open_count/last_opened del elemento con ese id, en la
+    lista `items` (in place). No guarda a disco: quien llame decide
+    cuándo hacer save_shortcuts."""
+    for it in items:
+        if it["id"] == item_id:
+            it["open_count"] = int(it.get("open_count", 0) or 0) + 1
+            it["last_opened"] = time.time()
+            return
+
+
+def most_used_items(items: list[dict], limit: int = 10) -> list[dict]:
+    """Devuelve hasta `limit` accesos (no carpetas) ordenados por número
+    de aperturas, de más a menos usado. Ignora los que nunca se han
+    abierto."""
+    used = [
+        it for it in items
+        if it["type"] == "shortcut" and int(it.get("open_count", 0) or 0) > 0
+    ]
+    used.sort(key=lambda it: (-int(it.get("open_count", 0) or 0), -(it.get("last_opened") or 0)))
+    return used[:limit]
+
+
 def ensure_user_data_dir() -> None:
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -168,6 +212,7 @@ def load_settings() -> dict:
     )
     geometry = data.get("window_geometry", "")
     merged["window_geometry"] = str(geometry) if isinstance(geometry, str) else ""
+    merged["snap_to_grid"] = bool(data.get("snap_to_grid", DEFAULT_SETTINGS["snap_to_grid"]))
     categories = data.get("categories", {})
     merged["categories"] = (
         {str(k): str(v) for k, v in categories.items()} if isinstance(categories, dict) else {}
@@ -320,6 +365,24 @@ def _normalize_items(raw: list) -> list[dict]:
         size = entry.get("size")
         size = size if size in SIZE_PRESETS else DEFAULT_SIZE
 
+        # Tamaño personalizado (arrastrando la esquina de la tarjeta), en
+        # píxeles. Si están presentes, mandan sobre el preset "size" de
+        # arriba. None = usar el preset, como hasta ahora.
+        width = entry.get("width")
+        height = entry.get("height")
+        try:
+            width = int(width) if width is not None else None
+        except (TypeError, ValueError):
+            width = None
+        try:
+            height = int(height) if height is not None else None
+        except (TypeError, ValueError):
+            height = None
+        if width is not None:
+            width = max(MIN_TILE_WIDTH, min(MAX_TILE_WIDTH, width))
+        if height is not None:
+            height = max(MIN_TILE_HEIGHT, min(MAX_TILE_HEIGHT, height))
+
         color = entry.get("color")
         color = str(color) if color else None
 
@@ -343,6 +406,8 @@ def _normalize_items(raw: list) -> list[dict]:
             "order": entry.get("order", 0),
             "color": color,
             "size": size,
+            "width": width,
+            "height": height,
             "category": category,
             "open_count": open_count,
             "last_opened": last_opened,
@@ -412,6 +477,109 @@ def save_shortcuts(items: list[dict]) -> None:
     with SHORTCUTS_PATH.open("w", encoding="utf-8") as handle:
         json.dump({"items": normalized}, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# Accesos directos de Windows (.lnk): parser binario mínimo, sin pywin32
+# (mismo criterio que win_icons.py), para poder arrastrar un .lnk desde
+# el Explorador y que la app guarde la ruta REAL a la que apunta (por
+# ejemplo el .exe de un programa) en vez de la ruta al propio .lnk.
+#
+# Formato: "[MS-SHLLINK]: Shell Link (.LNK) Binary File Format", de
+# Microsoft. Solo se interpreta lo necesario para sacar la ruta de
+# destino (ShellLinkHeader + LinkInfo → LocalBasePath / CommonPathSuffix,
+# con preferencia por sus variantes Unicode si existen). Si el .lnk usa
+# solo un LinkTargetIDList (por ejemplo accesos a la papelera de
+# reciclaje, "Este equipo", o rutas de red exóticas) sin LinkInfo, no se
+# puede resolver con este parser ligero y se devuelve None: quien llame
+# debe entonces usar el propio .lnk como destino, o descartarlo.
+# ---------------------------------------------------------------------------
+
+import struct as _struct
+
+_LNK_MAGIC = bytes.fromhex("4C0000000114020000000000C000000000000046")
+
+
+def _lnk_read_cstring(data: bytes, offset: int, unicode: bool) -> str | None:
+    if offset <= 0 or offset >= len(data):
+        return None
+    if unicode:
+        end = offset
+        while end + 1 < len(data) and data[end:end + 2] != b"\x00\x00":
+            end += 2
+        try:
+            return data[offset:end].decode("utf-16-le", errors="ignore")
+        except Exception:
+            return None
+    end = data.find(b"\x00", offset)
+    if end == -1:
+        end = len(data)
+    try:
+        return data[offset:end].decode("mbcs" if sys.platform == "win32" else "latin-1", errors="ignore")
+    except Exception:
+        return None
+
+
+def resolve_lnk_target(lnk_path) -> str | None:
+    """Intenta extraer la ruta de destino real de un acceso directo .lnk
+    de Windows, leyendo su formato binario a mano (sin pywin32/COM).
+    Devuelve None si el archivo no es un .lnk válido o no se puede
+    resolver (best effort, nunca lanza excepción)."""
+    try:
+        data = Path(lnk_path).read_bytes()
+    except OSError:
+        return None
+
+    if len(data) < 76 or data[:20] != _LNK_MAGIC:
+        return None
+
+    try:
+        link_flags = _struct.unpack_from("<I", data, 20)[0]
+        has_id_list = bool(link_flags & 0x1)
+        has_link_info = bool(link_flags & 0x2)
+
+        offset = 76
+        if has_id_list:
+            if offset + 2 > len(data):
+                return None
+            id_list_size = _struct.unpack_from("<H", data, offset)[0]
+            offset += 2 + id_list_size
+
+        target: str | None = None
+        if has_link_info and offset + 4 <= len(data):
+            link_info_start = offset
+            link_info_size = _struct.unpack_from("<I", data, offset)[0]
+            header_size = _struct.unpack_from("<I", data, offset + 4)[0]
+            info_flags = _struct.unpack_from("<I", data, offset + 8)[0]
+            local_base_offset = _struct.unpack_from("<I", data, offset + 16)[0]
+            suffix_offset = _struct.unpack_from("<I", data, offset + 20)[0]
+
+            local_base_u = suffix_u = 0
+            if header_size >= 0x24 and offset + 0x24 <= len(data):
+                local_base_u = _struct.unpack_from("<I", data, offset + 0x1C)[0]
+                suffix_u = _struct.unpack_from("<I", data, offset + 0x20)[0]
+
+            has_local_path = bool(info_flags & 0x1)
+            if has_local_path:
+                base = None
+                if local_base_u:
+                    base = _lnk_read_cstring(data, link_info_start + local_base_u, unicode=True)
+                if not base and local_base_offset:
+                    base = _lnk_read_cstring(data, link_info_start + local_base_offset, unicode=False)
+                suffix = None
+                if suffix_u:
+                    suffix = _lnk_read_cstring(data, link_info_start + suffix_u, unicode=True)
+                if suffix is None and suffix_offset:
+                    suffix = _lnk_read_cstring(data, link_info_start + suffix_offset, unicode=False)
+                if base:
+                    target = base + (suffix or "")
+            offset = link_info_start + link_info_size
+
+        if target:
+            return target
+    except (_struct.error, IndexError):
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------

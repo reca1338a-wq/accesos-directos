@@ -13,6 +13,7 @@ llegan en las fases siguientes.
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -65,6 +66,11 @@ from PySide6.QtWidgets import (
 import win_icons
 from app_config import (
     DEFAULT_SIZE,
+    GRID_SNAP_STEP,
+    MAX_TILE_HEIGHT,
+    MAX_TILE_WIDTH,
+    MIN_TILE_HEIGHT,
+    MIN_TILE_WIDTH,
     SIZE_PRESETS,
     SORT_MODES,
     THEMES,
@@ -76,13 +82,17 @@ from app_config import (
     load_settings,
     load_shortcuts,
     load_trash,
+    most_used_items,
     new_item_id,
     portabilize_path,
     purge_old_trash,
+    record_item_opened,
+    resolve_lnk_target,
     save_settings,
     save_shortcuts,
     save_trash,
     set_startup_enabled,
+    snap_dimension,
     startup_supported,
     TRASH_RETENTION_DAYS,
 )
@@ -230,6 +240,8 @@ class TileWidget(QFrame):
     drag_hover = Signal(dict, str)  # (target_item, "before"|"after"|"into"|"")
     drop_received = Signal(dict, list, str)  # (target_item, dragged_ids, side)
     files_dropped_here = Signal(dict, list)  # (target_item, local_paths)
+    resize_moved = Signal(dict, int, int)  # (item, new_width, new_height) — mientras se arrastra
+    resize_finished = Signal(dict, int, int)  # (item, new_width, new_height) — al soltar
 
     def __init__(
         self, item: dict, colors: dict, sibling_items: list[dict],
@@ -242,17 +254,30 @@ class TileWidget(QFrame):
         self.subtitle_override = subtitle_override
         categories = categories or {}
         preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
+        # Un tamaño personalizado (arrastrando la esquina, ver _resize_handle_rect)
+        # manda sobre el preset pequeño/mediano/grande.
+        tile_width = item.get("width") or preset["width"]
+        tile_height = item.get("height") or preset["height"]
 
         self.setObjectName("tile")
         if compact:
             self.setFixedSize(max(preset["width"], 220), 40)
         else:
-            self.setFixedSize(preset["width"], preset["height"])
+            self.setFixedSize(tile_width, tile_height)
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setAcceptDrops(True)
         self._selected = False
         self._press_pos: QPoint | None = None
         self._dragging = False
+        # -- redimensionado a mano (estilo Power BI / Canva), solo en modo
+        # tarjeta: se detecta la zona de agarre (esquina inferior derecha)
+        # a mano en los eventos de ratón, sin crear un widget hijo aparte,
+        # para no interferir con el resto de la lógica de clic/arrastre.
+        self._resizable = not compact
+        self._resize_grip = 14
+        self._resizing = False
+        self._resize_start_pos: QPoint | None = None
+        self._resize_start_size: QSize | None = None
 
         is_broken = bool(
             item["type"] == "shortcut"
@@ -343,6 +368,35 @@ class TileWidget(QFrame):
 
         layout.addStretch()
 
+        self._grip_label = QLabel(self)
+        self._grip_label.setText("⋰")
+        self._grip_label.setObjectName("resizeGrip")
+        self._grip_label.setAlignment(Qt.AlignCenter)
+        self._grip_label.setFixedSize(self._resize_grip, self._resize_grip)
+        self._grip_label.setCursor(QCursor(Qt.SizeFDiagCursor))
+        self._grip_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._position_grip()
+
+    def _position_grip(self) -> None:
+        if getattr(self, "_grip_label", None) is None:
+            return
+        self._grip_label.move(
+            self.width() - self._resize_grip - 2, self.height() - self._resize_grip - 2
+        )
+
+    def resizeEvent(self, event) -> None:
+        self._position_grip()
+        super().resizeEvent(event)
+
+    def _in_resize_zone(self, pos: QPoint) -> bool:
+        if not self._resizable:
+            return False
+        zone = QRect(
+            self.width() - self._resize_grip - 4, self.height() - self._resize_grip - 4,
+            self._resize_grip + 4, self._resize_grip + 4,
+        )
+        return zone.contains(pos)
+
     def _load_icon(self, sibling_items: list[dict], icon_px: int):
         if self.item["type"] == "folder":
             children = [it for it in sibling_items if it["parent_id"] == self.item["id"]]
@@ -398,11 +452,26 @@ class TileWidget(QFrame):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            self._press_pos = event.position().toPoint()
+            pos = event.position().toPoint()
+            if self._in_resize_zone(pos):
+                self._resizing = True
+                self._resize_start_pos = event.globalPosition().toPoint()
+                self._resize_start_size = self.size()
+                event.accept()
+                return
+            self._press_pos = pos
             self._dragging = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._resizing and self._resize_start_pos is not None:
+            delta = event.globalPosition().toPoint() - self._resize_start_pos
+            new_w = max(MIN_TILE_WIDTH, min(MAX_TILE_WIDTH, self._resize_start_size.width() + delta.x()))
+            new_h = max(MIN_TILE_HEIGHT, min(MAX_TILE_HEIGHT, self._resize_start_size.height() + delta.y()))
+            self.setFixedSize(new_w, new_h)
+            self.resize_moved.emit(self.item, new_w, new_h)
+            event.accept()
+            return
         if (
             self._press_pos is not None
             and (event.buttons() & Qt.LeftButton)
@@ -417,6 +486,12 @@ class TileWidget(QFrame):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._resizing:
+            self._resizing = False
+            self._resize_start_pos = None
+            self.resize_finished.emit(self.item, self.width(), self.height())
+            event.accept()
+            return
         was_dragging = self._dragging
         self._dragging = False
         inside = self.rect().contains(event.position().toPoint())
@@ -678,6 +753,16 @@ class MainWindow(QMainWindow):
         self._flow_sections: list = []
         self._focus_index: int = -1
 
+        # Deshacer/rehacer (Ctrl+Z / Ctrl+Shift+Z): pila de instantáneas de
+        # accesos+papelera, en memoria (no persiste entre ejecuciones).
+        self._undo_stack: list[tuple[str, list, list]] = []
+        self._redo_stack: list[tuple[str, list, list]] = []
+        self._UNDO_LIMIT = 30
+
+        # Portapapeles interno (Ctrl+C / Ctrl+V): copia de la selección
+        # actual (con sus subcarpetas), lista para duplicarse en Ctrl+V.
+        self._clipboard: dict | None = None
+
         self.setWindowTitle("Accesos Directos")
         self.resize(820, 600)
         self.setMinimumSize(480, 360)
@@ -743,9 +828,16 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.update_icon)
         root_layout.addLayout(header_row)
 
-        self.breadcrumb_label = QLabel()
-        self.breadcrumb_label.setObjectName("breadcrumb")
-        root_layout.addWidget(self.breadcrumb_label)
+        self.breadcrumb_row = QWidget()
+        self._breadcrumb_layout = QHBoxLayout(self.breadcrumb_row)
+        self._breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
+        self._breadcrumb_layout.setSpacing(4)
+        root_layout.addWidget(self.breadcrumb_row)
+
+        self.search_status_label = QLabel()
+        self.search_status_label.setObjectName("breadcrumb")
+        self.search_status_label.hide()
+        root_layout.addWidget(self.search_status_label)
 
         divider = QFrame()
         divider.setObjectName("divider")
@@ -801,6 +893,13 @@ class MainWindow(QMainWindow):
         self.category_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.category_button.clicked.connect(self.show_category_menu)
         toolbar_row2.addWidget(self.category_button)
+
+        stats_button = QPushButton("📊  Más usados")
+        stats_button.setObjectName("ghostButton")
+        stats_button.setCursor(QCursor(Qt.PointingHandCursor))
+        stats_button.setToolTip("Estadísticas de uso")
+        stats_button.clicked.connect(self.open_usage_stats_dialog)
+        toolbar_row2.addWidget(stats_button)
 
         toolbar_row2.addStretch()
 
@@ -873,6 +972,16 @@ class MainWindow(QMainWindow):
             QLabel#updateIcon {{ font-size: 18px; padding: 4px; }}
             QLabel#updateIcon:hover {{ color: {c['accent']}; }}
             QLabel#breadcrumb {{ color: {c['text_muted']}; font-size: 12px; margin-top: 4px; }}
+            QLabel#breadcrumbSep {{ color: {c['text_muted']}; font-size: 12px; }}
+            QPushButton#breadcrumbLink {{
+                color: {c['text_muted']}; font-size: 12px; border: none; background: transparent;
+                padding: 0px; text-decoration: underline;
+            }}
+            QPushButton#breadcrumbLink:hover {{ color: {c['accent']}; }}
+            QPushButton#breadcrumbLast {{
+                color: {c['text']}; font-size: 12px; font-weight: 600; border: none;
+                background: transparent; padding: 0px;
+            }}
             QFrame#divider {{ background: {c['surface']}; border: none; }}
             QLabel#emptyLabel {{ color: {c['text_muted']}; font-size: 13px; }}
             QLabel#footer {{ color: {c['text_muted']}; font-size: 10px; margin-top: 6px; }}
@@ -903,6 +1012,9 @@ class MainWindow(QMainWindow):
             QFrame#tile[selected="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
             QFrame#tile[dropTarget="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
             QFrame#dropIndicator {{ background: {c['accent']}; border-radius: 2px; }}
+            QLabel#resizeGrip {{
+                color: {c['text_muted']}; font-size: 13px; background: transparent;
+            }}
             QLabel#tileName {{ color: {c['text']}; font-size: 12px; font-weight: 600; font-family: 'Segoe UI'; }}
             QLabel#tileSubtitle {{ color: {c['text_muted']}; font-size: 9px; }}
             QLabel#sectionHeader {{
@@ -952,8 +1064,45 @@ class MainWindow(QMainWindow):
         return groups
 
     def _render_breadcrumb(self) -> None:
-        self.breadcrumb_label.setText("  ›  ".join(name for name, _ in self.breadcrumb))
+        # Ruta de migas de pan clicable en cualquier punto: cada tramo es
+        # un botón (menos el último, la carpeta actual) que salta
+        # directamente a ese nivel, sin tener que pulsar "Atrás" varias
+        # veces uno a uno.
+        while self._breadcrumb_layout.count():
+            layout_item = self._breadcrumb_layout.takeAt(0)
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        for i, (name, _folder_id) in enumerate(self.breadcrumb):
+            if i > 0:
+                sep = QLabel("›")
+                sep.setObjectName("breadcrumbSep")
+                self._breadcrumb_layout.addWidget(sep)
+            is_last = i == len(self.breadcrumb) - 1
+            btn = QPushButton(name)
+            btn.setObjectName("breadcrumbLast" if is_last else "breadcrumbLink")
+            btn.setFlat(True)
+            btn.setCursor(QCursor(Qt.ArrowCursor if is_last else Qt.PointingHandCursor))
+            btn.setEnabled(not is_last)
+            btn.clicked.connect(lambda _checked=False, idx=i: self._jump_to_breadcrumb(idx))
+            self._breadcrumb_layout.addWidget(btn)
+        self._breadcrumb_layout.addStretch(1)
         self.back_button.setEnabled(self.current_folder_id is not None)
+
+    def _jump_to_breadcrumb(self, index: int) -> None:
+        if index >= len(self.breadcrumb) - 1:
+            return
+        self.breadcrumb = self.breadcrumb[: index + 1]
+        self.current_folder_id = self.breadcrumb[-1][1]
+        self.selected_ids = set()
+        self.category_filter = None
+        if self.search_query:
+            self.search_query = ""
+            self.search_box.blockSignals(True)
+            self.search_box.clear()
+            self.search_box.blockSignals(False)
+        self.refresh()
 
     def refresh(self) -> None:
         while self._sections_layout.count():
@@ -964,16 +1113,17 @@ class MainWindow(QMainWindow):
 
         self._drop_indicator.hide()
         self._drop_highlight_id = None
-        self._render_breadcrumb()
         self._tiles = []
         self._tile_by_id = {}
         self._flow_sections = []
         compact = self.settings.get("card_style") == "compact"
 
         if self.search_query:
+            self.breadcrumb_row.hide()
+            self.search_status_label.show()
             self.back_button.setEnabled(False)
             results = self._search_results()
-            self.breadcrumb_label.setText(
+            self.search_status_label.setText(
                 f"🔍 {len(results)} resultado(s) para «{self.search_query}»"
             )
             if not results:
@@ -984,6 +1134,10 @@ class MainWindow(QMainWindow):
             self._sections_layout.addStretch(1)
             self._relayout_sections()
             return
+
+        self.search_status_label.hide()
+        self.breadcrumb_row.show()
+        self._render_breadcrumb()
 
         grouped = bool(self.settings.get("group_by_category")) and self.category_filter is None
 
@@ -1042,6 +1196,8 @@ class MainWindow(QMainWindow):
             tile.drag_hover.connect(self.update_drop_indicator)
             tile.drop_received.connect(self.handle_internal_drop)
             tile.files_dropped_here.connect(self.handle_external_drop)
+            tile.resize_moved.connect(self.handle_tile_resize_moved)
+            tile.resize_finished.connect(self.handle_tile_resize_finished)
             tile.set_selected(item["id"] in self.selected_ids)
             flow.addWidget(tile)
             self._tiles.append(tile)
@@ -1088,6 +1244,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Archivo no encontrado", str(exc))
         except OSError as exc:
             QMessageBox.warning(self, "Error al abrir", str(exc))
+        else:
+            record_item_opened(self.shortcuts, item["id"])
+            save_shortcuts(self.shortcuts)
 
     # -- búsqueda ---------------------------------------------------------
 
@@ -1232,6 +1391,7 @@ class MainWindow(QMainWindow):
         dragged = [it for it in self.shortcuts if it["id"] in ids]
         if not dragged:
             return
+        self.push_undo("mover")
 
         # Evita mover una carpeta dentro de sí misma o de una de sus
         # propias tarjetas (crearía un bucle imposible de navegar).
@@ -1273,19 +1433,32 @@ class MainWindow(QMainWindow):
         }
         siblings = [it for it in self.shortcuts if it["parent_id"] == parent_id]
         added = 0
+        new_entries: list[dict] = []
         for raw_path in paths:
-            portable = portabilize_path(raw_path)
+            # Accesos directos de Windows (.lnk): en vez de guardar la ruta
+            # al propio .lnk, se intenta resolver el destino REAL al que
+            # apunta (por ejemplo el .exe de un programa), que es lo que
+            # el usuario espera al arrastrar un acceso directo. Si no se
+            # puede resolver (algunos .lnk usan formatos que este parser
+            # ligero no cubre), se guarda el .lnk tal cual como respaldo.
+            display_name = Path(raw_path).stem if raw_path.lower().endswith(".lnk") else Path(raw_path).name
+            resolved = resolve_lnk_target(raw_path) if raw_path.lower().endswith(".lnk") else None
+            actual_path = resolved or raw_path
+
+            portable = portabilize_path(actual_path)
             if portable in existing_paths:
                 continue
-            self.shortcuts.append({
+            new_entries.append({
                 "id": new_item_id(),
                 "type": "shortcut",
-                "name": Path(raw_path).name,
+                "name": display_name,
                 "path": portable,
                 "parent_id": parent_id,
                 "order": len(siblings) + added,
                 "color": None,
                 "size": DEFAULT_SIZE,
+                "width": None,
+                "height": None,
                 "category": None,
                 "open_count": 0,
                 "last_opened": 0.0,
@@ -1293,6 +1466,8 @@ class MainWindow(QMainWindow):
             existing_paths.add(portable)
             added += 1
         if added:
+            self.push_undo("añadir")
+            self.shortcuts.extend(new_entries)
             save_shortcuts(self.shortcuts)
             self.refresh()
 
@@ -1301,9 +1476,21 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event) -> None:
         key = event.key()
         ordered = self._tiles
-        if event.modifiers() & Qt.ControlModifier and key == Qt.Key_F:
+        ctrl = bool(event.modifiers() & Qt.ControlModifier)
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+        if ctrl and key == Qt.Key_F:
             self.search_box.setFocus()
             self.search_box.selectAll()
+        elif ctrl and key == Qt.Key_Z and shift:
+            self.redo()
+        elif ctrl and key == Qt.Key_Z:
+            self.undo()
+        elif ctrl and key == Qt.Key_Y:
+            self.redo()
+        elif ctrl and key == Qt.Key_C and self.selected_ids:
+            self.copy_selected()
+        elif ctrl and key == Qt.Key_V and self._clipboard:
+            self.paste_clipboard()
         elif key == Qt.Key_Escape and self.search_query:
             self.search_box.clear()
         elif key == Qt.Key_Escape:
@@ -1312,7 +1499,7 @@ class MainWindow(QMainWindow):
         elif key in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected_ids:
             items = [it for it in self.shortcuts if it["id"] in self.selected_ids]
             self._delete_items(items)
-        elif event.modifiers() & Qt.ControlModifier and key == Qt.Key_A and ordered:
+        elif ctrl and key == Qt.Key_A and ordered:
             self.select_all()
         elif key == Qt.Key_Return and len(self.selected_ids) == 1:
             item = next((t.item for t in ordered if t.item["id"] in self.selected_ids), None)
@@ -1357,6 +1544,10 @@ class MainWindow(QMainWindow):
         menu.addMenu(self._build_category_assignment_menu(selected_items or [item]))
         menu.addMenu(self._build_size_menu(selected_items or [item]))
         menu.addSeparator()
+        menu.addAction("Copiar\tCtrl+C", self.copy_selected)
+        if self._clipboard:
+            menu.addAction("Pegar\tCtrl+V", self.paste_clipboard)
+        menu.addSeparator()
         if len(selected_items) <= 1:
             menu.addAction("Quitar", lambda: self._delete_items([item]))
         else:
@@ -1382,14 +1573,20 @@ class MainWindow(QMainWindow):
         return menu
 
     def _assign_category(self, items: list[dict], name: str | None) -> None:
+        self.push_undo("categoría")
         for item in items:
             item["category"] = name
         save_shortcuts(self.shortcuts)
         self.refresh()
 
     def _assign_size(self, items: list[dict], size: str) -> None:
+        self.push_undo("tamaño")
         for item in items:
             item["size"] = size
+            # Un preset elegido a mano desde el menú anula cualquier
+            # tamaño personalizado previo (arrastrando la esquina).
+            item["width"] = None
+            item["height"] = None
         save_shortcuts(self.shortcuts)
         self.refresh()
 
@@ -1410,9 +1607,162 @@ class MainWindow(QMainWindow):
     def rename_item(self, item: dict) -> None:
         name, ok = QInputDialog.getText(self, "Renombrar", "Nuevo nombre:", text=item["name"])
         if ok and name.strip():
+            self.push_undo("renombrar")
             item["name"] = name.strip()
             save_shortcuts(self.shortcuts)
             self.refresh()
+
+    # -- deshacer / rehacer -------------------------------------------------
+    #
+    # Guarda una instantánea completa de accesos+papelera ANTES de cada
+    # operación que los modifica (borrar, mover, redimensionar, pegar,
+    # renombrar, cambiar categoría/tamaño...). Es más simple y fiable que
+    # llevar la cuenta de "el opuesto de cada acción" a mano, a costa de
+    # algo más de memoria — asumible para unas pocas decenas de pasos.
+
+    def push_undo(self, label: str) -> None:
+        snapshot = (label, copy.deepcopy(self.shortcuts), copy.deepcopy(load_trash()))
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _current_snapshot(self, label: str) -> tuple[str, list, list]:
+        return (label, copy.deepcopy(self.shortcuts), copy.deepcopy(load_trash()))
+
+    def undo(self) -> None:
+        if not self._undo_stack:
+            return
+        label, shortcuts_snapshot, trash_snapshot = self._undo_stack.pop()
+        self._redo_stack.append(self._current_snapshot(label))
+        self.shortcuts = shortcuts_snapshot
+        save_shortcuts(self.shortcuts)
+        save_trash(trash_snapshot)
+        self.selected_ids = set()
+        self.refresh()
+
+    def redo(self) -> None:
+        if not self._redo_stack:
+            return
+        label, shortcuts_snapshot, trash_snapshot = self._redo_stack.pop()
+        self._undo_stack.append(self._current_snapshot(label))
+        self.shortcuts = shortcuts_snapshot
+        save_shortcuts(self.shortcuts)
+        save_trash(trash_snapshot)
+        self.selected_ids = set()
+        self.refresh()
+
+    # -- copiar / pegar (Ctrl+C / Ctrl+V) ------------------------------------
+
+    def copy_selected(self) -> None:
+        selected = [it for it in self.shortcuts if it["id"] in self.selected_ids]
+        if not selected:
+            return
+        root_ids = {it["id"] for it in selected}
+        all_items = list(selected)
+        seen_ids = set(root_ids)
+        pending = list(selected)
+        while pending:
+            current = pending.pop()
+            if current["type"] != "folder":
+                continue
+            children = [it for it in self.shortcuts if it.get("parent_id") == current["id"]]
+            for child in children:
+                if child["id"] not in seen_ids:
+                    seen_ids.add(child["id"])
+                    all_items.append(child)
+                    pending.append(child)
+        self._clipboard = {"root_ids": root_ids, "items": copy.deepcopy(all_items)}
+
+    def paste_clipboard(self) -> None:
+        clip = self._clipboard
+        if not clip or not clip.get("items"):
+            return
+        self.push_undo("pegar")
+        id_map = {it["id"]: new_item_id() for it in clip["items"]}
+        siblings = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
+        next_order = len(siblings)
+        new_items = []
+        for it in clip["items"]:
+            new_it = copy.deepcopy(it)
+            new_it["id"] = id_map[it["id"]]
+            if it["id"] in clip["root_ids"]:
+                new_it["parent_id"] = self.current_folder_id
+                new_it["order"] = next_order
+                next_order += 1
+                new_it["name"] = f"{it['name']} (copia)"
+            else:
+                new_it["parent_id"] = id_map.get(it["parent_id"], it["parent_id"])
+            new_it["open_count"] = 0
+            new_it["last_opened"] = 0.0
+            new_items.append(new_it)
+        self.shortcuts.extend(new_items)
+        save_shortcuts(self.shortcuts)
+        self.selected_ids = {id_map[i] for i in clip["root_ids"]}
+        self.refresh()
+
+    # -- redimensionar a mano (arrastrar esquina) ----------------------------
+
+    def handle_tile_resize_moved(self, item: dict, width: int, height: int) -> None:
+        # Solo reajusta el flujo mientras se arrastra; no toca el disco
+        # hasta que se suelta (handle_tile_resize_finished), para no
+        # generar decenas de escrituras por segundo.
+        self._relayout_sections()
+
+    def handle_tile_resize_finished(self, item: dict, width: int, height: int) -> None:
+        if self.settings.get("snap_to_grid", True):
+            width = snap_dimension(width, GRID_SNAP_STEP)
+            height = snap_dimension(height, GRID_SNAP_STEP)
+        self.push_undo("redimensionar")
+        for it in self.shortcuts:
+            if it["id"] == item["id"]:
+                it["width"] = width
+                it["height"] = height
+                break
+        save_shortcuts(self.shortcuts)
+        self.refresh()
+
+    # -- estadísticas de uso --------------------------------------------------
+
+    def open_usage_stats_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Más usados")
+        dialog.resize(380, 420)
+        layout = QVBoxLayout(dialog)
+
+        top_items = most_used_items(self.shortcuts, limit=15)
+        if not top_items:
+            layout.addWidget(QLabel(
+                "Todavía no hay estadísticas de uso.\n"
+                "Se irán acumulando a medida que abras accesos."
+            ))
+        else:
+            rows_container = QWidget()
+            rows_layout = QVBoxLayout(rows_container)
+            rows_layout.setContentsMargins(0, 0, 0, 0)
+            for rank, item in enumerate(top_items, start=1):
+                row_widget = QWidget()
+                row = QHBoxLayout(row_widget)
+                row.setContentsMargins(0, 2, 0, 2)
+                row.addWidget(QLabel(f"{rank}."))
+                name_label = QLabel(item["name"])
+                row.addWidget(name_label, stretch=1)
+                count = int(item.get("open_count", 0) or 0)
+                times = "vez" if count == 1 else "veces"
+                count_label = QLabel(f"{count} {times}")
+                count_label.setStyleSheet(f"color: {self.colors['text_muted']}; font-size: 11px;")
+                row.addWidget(count_label)
+                rows_layout.addWidget(row_widget)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(rows_container)
+            layout.addWidget(scroll, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.close)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _delete_items(self, items: list[dict]) -> None:
         if not items:
@@ -1426,6 +1776,7 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
+        self.push_undo("quitar")
         ids = {it["id"] for it in items}
         # Si se borra una carpeta, sus elementos internos van también a la
         # papelera (si no, quedarían "huérfanos" sin carpeta que los
@@ -1475,6 +1826,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Nombre del acceso", "Nombre:", text=default_name)
         if not ok or not name.strip():
             return
+        self.push_undo("añadir")
         siblings = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
         self.shortcuts.append({
             "id": new_item_id(),
@@ -1485,6 +1837,8 @@ class MainWindow(QMainWindow):
             "order": len(siblings),
             "color": None,
             "size": DEFAULT_SIZE,
+            "width": None,
+            "height": None,
             "category": None,
             "open_count": 0,
             "last_opened": 0.0,
@@ -1496,6 +1850,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Nombre de la carpeta", "Nombre:", text="Nueva carpeta")
         if not ok or not name.strip():
             return
+        self.push_undo("añadir")
         siblings = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
         self.shortcuts.append({
             "id": new_item_id(),
@@ -1505,6 +1860,8 @@ class MainWindow(QMainWindow):
             "order": len(siblings),
             "color": None,
             "size": DEFAULT_SIZE,
+            "width": None,
+            "height": None,
             "category": None,
             "open_count": 0,
             "last_opened": 0.0,
@@ -1742,6 +2099,15 @@ class MainWindow(QMainWindow):
         auto_update_check.setChecked(bool(self.settings.get("auto_check_updates", True)))
         layout.addWidget(auto_update_check)
 
+        snap_check = QCheckBox("Ajustar a rejilla al redimensionar tarjetas")
+        snap_check.setToolTip(
+            "Al arrastrar la esquina de una tarjeta para cambiar su tamaño, "
+            "el resultado se ajusta a múltiplos de "
+            f"{GRID_SNAP_STEP}px para que queden mejor alineadas entre sí."
+        )
+        snap_check.setChecked(bool(self.settings.get("snap_to_grid", True)))
+        layout.addWidget(snap_check)
+
         startup_check = None
         if startup_supported():
             startup_check = QCheckBox("Iniciar con Windows")
@@ -1780,6 +2146,7 @@ class MainWindow(QMainWindow):
             self.settings["theme"] = theme_key
             self.settings["click_mode"] = "single" if single_radio.isChecked() else "double"
             self.settings["auto_check_updates"] = auto_update_check.isChecked()
+            self.settings["snap_to_grid"] = snap_check.isChecked()
             if startup_check is not None:
                 set_startup_enabled(startup_check.isChecked())
             save_settings(self.settings)

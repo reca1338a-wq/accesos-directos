@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import io
 import shutil
 import sys
 from ctypes import wintypes
@@ -33,10 +34,9 @@ from pathlib import Path
 _ICON_SUPPORTED = sys.platform == "win32"
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image
 except ImportError:  # Pillow no instalado.
     Image = None  # type: ignore[assignment]
-    ImageTk = None  # type: ignore[assignment]
 
 try:
     from app_config import USER_DATA_DIR
@@ -54,6 +54,27 @@ _DISK_CACHE_DIR = USER_DATA_DIR / "icon_cache"
 # icono asociado a esa extensión, mostramos una miniatura real del propio
 # archivo. Esto solo necesita Pillow, no hace falta ser Windows.
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".ico"}
+
+# PDF: se renderiza la primera página como miniatura real (no solo el
+# icono de Adobe/el lector por defecto). Necesita PyMuPDF (paquete
+# "pymupdf", se importa como "fitz"); es opcional — si no está instalado
+# la app sigue funcionando y usa el icono normal de Windows para los PDF.
+PDF_EXTENSIONS = {".pdf"}
+try:
+    import pymupdf as fitz  # PyMuPDF (nombre nuevo del paquete; "fitz" es el alias legado)
+except ImportError:
+    try:
+        import fitz  # compatibilidad con instalaciones antiguas de PyMuPDF
+    except ImportError:
+        fitz = None  # type: ignore[assignment]
+
+# Word (.docx/.docm): muchos documentos de Office llevan guardada una
+# miniatura de la primera página dentro del propio archivo (que es un
+# .zip) en docProps/thumbnail.jpeg o .emf/.wmf — la reutilizamos si está
+# presente, en vez de renderizar el documento entero (que necesitaría
+# Word instalado). Si el documento no la lleva incluida (Word no siempre
+# la guarda), se recurre al icono normal como hasta ahora.
+WORD_EXTENSIONS = {".docx", ".docm"}
 
 # Caché de iconos ya extraídos (PhotoImage), para no releer el disco ni
 # volver a dibujar el icono cada vez que se redibuja la cuadrícula de
@@ -126,6 +147,10 @@ def _get_icon_image(path: str, size: int):
     if image is not None:
         return image
     image = _extract_image_thumbnail(path, size)
+    if image is None:
+        image = _extract_pdf_thumbnail(path, size)
+    if image is None:
+        image = _extract_word_thumbnail(path, size)
     if image is None and _ICON_SUPPORTED:
         image = _extract_icon_image(path, size)
     if image is not None:
@@ -145,14 +170,14 @@ def get_icon_image(path: str, size: int = 32):
 
 
 def get_icon_photo(path: str, size: int = 32):
-    """Devuelve un ImageTk.PhotoImage para `path`, o None si no se puede.
+    """Devuelve la imagen PIL (RGBA) del icono de `path`, o None si no
+    se puede.
 
-    Para archivos de imagen (png, jpg...) se usa una miniatura real del
-    propio archivo. Para el resto, se pide a Windows el icono de la
-    aplicación predeterminada asociada a esa extensión (el mismo que se
-    ve en el Explorador). Si nada de eso está disponible (falta Pillow,
-    no es Windows, o falla la llamada), devuelve None para que el que
-    llama use un icono de repuesto (emoji)."""
+    Nota histórica: en la versión antigua (Tkinter) esta función
+    devolvía un ImageTk.PhotoImage; con PySide6 lo que se necesita es un
+    QPixmap, y esa conversión la hace `main.pil_to_pixmap` a partir de la
+    imagen PIL. Se mantiene el nombre por compatibilidad, pero ahora es
+    un simple alias de `get_icon_image` con su propia caché en memoria."""
     if not path:
         return None
 
@@ -160,16 +185,13 @@ def get_icon_photo(path: str, size: int = 32):
     if key in _icon_cache:
         return _icon_cache[key]
 
-    photo = None
     try:
         image = _get_icon_image(path, size)
-        if image is not None:
-            photo = ImageTk.PhotoImage(image)
     except Exception:
-        photo = None
+        image = None
 
-    _icon_cache[key] = photo
-    return photo
+    _icon_cache[key] = image
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -191,9 +213,9 @@ def compose_folder_icon(preview_paths: "list[str | None]", size: int = 40):
     """Dibuja un icono de carpeta con hasta 3 miniaturas de
     `preview_paths` (rutas de archivo; None se ignora, por ejemplo para
     subcarpetas) colocadas dentro, a modo de vista previa del contenido.
-    Devuelve un ImageTk.PhotoImage, o None si Pillow no está disponible.
+    Devuelve una imagen PIL (RGBA), o None si Pillow no está disponible.
     """
-    if Image is None or ImageTk is None:
+    if Image is None:
         return None
 
     key = (tuple(preview_paths), size)
@@ -250,7 +272,7 @@ def compose_folder_icon(preview_paths: "list[str | None]", size: int = 40):
             card.paste(inner, (2, 2), inner)
             canvas.paste(card, (start_x + i * (mini_size + gap), y), card)
 
-    photo = ImageTk.PhotoImage(canvas)
+    photo = canvas
     _folder_icon_cache[key] = photo
     return photo
 
@@ -309,6 +331,70 @@ def _extract_image_thumbnail(path: str, size: int):
             offset = ((size - source.width) // 2, (size - source.height) // 2)
             canvas.paste(source, offset, source)
             return canvas
+    except Exception:
+        return None
+
+
+def _fit_on_square_canvas(source, size: int):
+    """Redimensiona `source` (PIL, ya en RGBA) para que quepa en un
+    lienzo cuadrado de `size`x`size` manteniendo proporción, centrado,
+    con fondo transparente — mismo tratamiento que las miniaturas de
+    imagen, para que todas las tarjetas queden visualmente consistentes."""
+    source = source.convert("RGBA")
+    source.thumbnail((size, size), Image.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    offset = ((size - source.width) // 2, (size - source.height) // 2)
+    canvas.paste(source, offset, source)
+    return canvas
+
+
+def _extract_pdf_thumbnail(path: str, size: int):
+    """Miniatura real de la primera página de un PDF, vía PyMuPDF. Se
+    renderiza a mayor resolución que el tamaño final del icono (2x) para
+    que no se vea borrosa al reducir, y se recorta/centra sobre un
+    lienzo cuadrado como el resto de miniaturas."""
+    if fitz is None:
+        return None
+    target = Path(path)
+    if target.suffix.lower() not in PDF_EXTENSIONS or not target.exists():
+        return None
+    try:
+        with fitz.open(target) as doc:
+            if doc.page_count == 0:
+                return None
+            page = doc.load_page(0)
+            rect = page.rect
+            longest = max(rect.width, rect.height) or 1
+            zoom = (size * 2) / longest
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            mode = "RGB" if pix.n < 4 else "RGBA"
+            image = Image.frombytes(mode, (pix.width, pix.height), pix.samples).convert("RGBA")
+        return _fit_on_square_canvas(image, size)
+    except Exception:
+        return None
+
+
+def _extract_word_thumbnail(path: str, size: int):
+    """Miniatura de un .docx/.docm a partir de la vista previa que el
+    propio Word guarda dentro del archivo (docProps/thumbnail.*), si
+    existe. Un .docx es un .zip, así que no hace falta ninguna librería
+    extra aparte de Pillow para leerlo."""
+    target = Path(path)
+    if target.suffix.lower() not in WORD_EXTENSIONS or not target.exists() or Image is None:
+        return None
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(target) as archive:
+            thumb_name = next(
+                (n for n in archive.namelist() if n.lower().startswith("docprops/thumbnail")),
+                None,
+            )
+            if thumb_name is None:
+                return None
+            raw = archive.read(thumb_name)
+        with Image.open(io.BytesIO(raw)) as source:
+            return _fit_on_square_canvas(source, size)
     except Exception:
         return None
 
