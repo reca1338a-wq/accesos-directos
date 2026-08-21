@@ -46,6 +46,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='/home/manuel/Imágenes/icono.ico',
 )
 
 # COLLECT (en vez de meter a.binaries/a.datas en el EXE de arriba) es lo
