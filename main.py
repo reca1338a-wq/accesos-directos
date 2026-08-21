@@ -233,12 +233,13 @@ class TileWidget(QFrame):
 
     def __init__(
         self, item: dict, colors: dict, sibling_items: list[dict],
-        categories: dict | None = None, compact: bool = False,
+        categories: dict | None = None, compact: bool = False, subtitle_override: str | None = None,
     ) -> None:
         super().__init__()
         self.item = item
         self.colors = colors
         self.compact = compact
+        self.subtitle_override = subtitle_override
         categories = categories or {}
         preset = SIZE_PRESETS.get(item.get("size", DEFAULT_SIZE), SIZE_PRESETS[DEFAULT_SIZE])
 
@@ -357,6 +358,8 @@ class TileWidget(QFrame):
         return pil_to_pixmap(image) if image is not None else None
 
     def _subtitle(self, sibling_items: list[dict]) -> str:
+        if self.subtitle_override is not None:
+            return self.subtitle_override
         if self.item["type"] == "folder":
             count = sum(1 for it in sibling_items if it["parent_id"] == self.item["id"])
             return f"{count} elemento" + ("" if count == 1 else "s")
@@ -659,6 +662,7 @@ class MainWindow(QMainWindow):
         self.current_folder_id: str | None = None
         self.breadcrumb: list[tuple[str, str | None]] = [("Inicio", None)]
         self.category_filter: str | None = None  # None=todas, ""=sin categoría, o el nombre
+        self.search_query: str = ""
 
         # Purga la papelera de lo que ya lleve más de la cuenta ahí dentro.
         trash = load_trash()
@@ -749,7 +753,7 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(divider)
         root_layout.addSpacing(12)
 
-        # -- barra de herramientas --
+        # -- barra de herramientas (fila 1: acciones + búsqueda) --
         toolbar_row = QHBoxLayout()
         add_button = QPushButton("+  Añadir")
         add_button.setObjectName("accentButton")
@@ -766,39 +770,55 @@ class MainWindow(QMainWindow):
 
         toolbar_row.addStretch()
 
+        self.search_box = QLineEdit()
+        self.search_box.setObjectName("searchBox")
+        self.search_box.setPlaceholderText("🔍  Buscar accesos...  (Ctrl+F)")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setMinimumWidth(240)
+        self.search_box.textChanged.connect(self._on_search_changed)
+        toolbar_row.addWidget(self.search_box, stretch=1)
+
+        root_layout.addLayout(toolbar_row)
+        root_layout.addSpacing(8)
+
+        # -- barra de herramientas (fila 2: orden / vista / categorías...) --
+        toolbar_row2 = QHBoxLayout()
+
         self.sort_button = QPushButton()
         self.sort_button.setObjectName("ghostButton")
         self.sort_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.sort_button.clicked.connect(self.show_sort_menu)
-        toolbar_row.addWidget(self.sort_button)
+        toolbar_row2.addWidget(self.sort_button)
 
         self.view_button = QPushButton()
         self.view_button.setObjectName("ghostButton")
         self.view_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.view_button.clicked.connect(self.toggle_view_style)
-        toolbar_row.addWidget(self.view_button)
+        toolbar_row2.addWidget(self.view_button)
 
         self.category_button = QPushButton("🏷  Categorías")
         self.category_button.setObjectName("ghostButton")
         self.category_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.category_button.clicked.connect(self.show_category_menu)
-        toolbar_row.addWidget(self.category_button)
+        toolbar_row2.addWidget(self.category_button)
+
+        toolbar_row2.addStretch()
 
         trash_button = QPushButton("🗑")
         trash_button.setObjectName("ghostButton")
         trash_button.setCursor(QCursor(Qt.PointingHandCursor))
         trash_button.setToolTip("Papelera")
         trash_button.clicked.connect(self.open_trash_dialog)
-        toolbar_row.addWidget(trash_button)
+        toolbar_row2.addWidget(trash_button)
 
         settings_button = QPushButton("⚙")
         settings_button.setObjectName("ghostButton")
         settings_button.setCursor(QCursor(Qt.PointingHandCursor))
         settings_button.setToolTip("Configuración")
         settings_button.clicked.connect(self.open_settings_dialog)
-        toolbar_row.addWidget(settings_button)
+        toolbar_row2.addWidget(settings_button)
 
-        root_layout.addLayout(toolbar_row)
+        root_layout.addLayout(toolbar_row2)
         root_layout.addSpacing(10)
         self._update_sort_button_text()
         self._update_view_button_text()
@@ -870,6 +890,12 @@ class MainWindow(QMainWindow):
             QPushButton#ghostButton:hover {{ background: {c['surface']}; }}
             QPushButton#ghostButton:disabled {{ color: {c['text_muted']}; border-color: {c['surface']}; }}
 
+            QLineEdit#searchBox {{
+                background: {c['surface']}; color: {c['text']}; border: 1px solid {c['surface_hover']};
+                border-radius: 10px; padding: 8px 10px; font-size: 12px;
+            }}
+            QLineEdit#searchBox:focus {{ border: 1px solid {c['accent']}; }}
+
             QFrame#tile {{
                 background: {c['surface']}; border-radius: 16px; border: 1px solid {c['surface']};
             }}
@@ -936,11 +962,29 @@ class MainWindow(QMainWindow):
                 layout_item.widget().hide()
                 layout_item.widget().deleteLater()
 
+        self._drop_indicator.hide()
+        self._drop_highlight_id = None
         self._render_breadcrumb()
         self._tiles = []
         self._tile_by_id = {}
         self._flow_sections = []
         compact = self.settings.get("card_style") == "compact"
+
+        if self.search_query:
+            self.back_button.setEnabled(False)
+            results = self._search_results()
+            self.breadcrumb_label.setText(
+                f"🔍 {len(results)} resultado(s) para «{self.search_query}»"
+            )
+            if not results:
+                self._sections_layout.addWidget(self.empty_label)
+            else:
+                path_map = {it["id"]: self._path_to_item(it) for it in results}
+                self._add_section(None, results, compact, path_map=path_map)
+            self._sections_layout.addStretch(1)
+            self._relayout_sections()
+            return
+
         grouped = bool(self.settings.get("group_by_category")) and self.category_filter is None
 
         if grouped:
@@ -963,7 +1007,9 @@ class MainWindow(QMainWindow):
         self._sections_layout.addStretch(1)
         self._relayout_sections()
 
-    def _add_section(self, label: str | None, items: list[dict], compact: bool) -> None:
+    def _add_section(
+        self, label: str | None, items: list[dict], compact: bool, path_map: dict[str, str] | None = None,
+    ) -> None:
         section = QWidget()
         section_layout = QVBoxLayout(section)
         section_layout.setContentsMargins(0, 0, 0, 0)
@@ -984,7 +1030,11 @@ class MainWindow(QMainWindow):
 
         categories = self.settings.get("categories", {})
         for item in items:
-            tile = TileWidget(item, self.colors, self.shortcuts, categories=categories, compact=compact)
+            subtitle_override = path_map.get(item["id"]) if path_map else None
+            tile = TileWidget(
+                item, self.colors, self.shortcuts, categories=categories, compact=compact,
+                subtitle_override=subtitle_override,
+            )
             tile.clicked_with_modifiers.connect(self.handle_tile_click)
             tile.double_clicked.connect(self.open_item)
             tile.context_requested.connect(self.show_context_menu)
@@ -1019,7 +1069,14 @@ class MainWindow(QMainWindow):
 
     def open_item(self, item: dict) -> None:
         if item["type"] == "folder":
-            self.breadcrumb.append((item["name"], item["id"]))
+            if self.search_query:
+                self.breadcrumb = self._breadcrumb_chain_for(item["id"])
+                self.search_query = ""
+                self.search_box.blockSignals(True)
+                self.search_box.clear()
+                self.search_box.blockSignals(False)
+            else:
+                self.breadcrumb.append((item["name"], item["id"]))
             self.current_folder_id = item["id"]
             self.category_filter = None
             self.selected_ids = set()
@@ -1031,6 +1088,36 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Archivo no encontrado", str(exc))
         except OSError as exc:
             QMessageBox.warning(self, "Error al abrir", str(exc))
+
+    # -- búsqueda ---------------------------------------------------------
+
+    def _on_search_changed(self, text: str) -> None:
+        self.search_query = text.strip().lower()
+        self.refresh()
+
+    def _search_results(self) -> list[dict]:
+        query = self.search_query
+        matches = [it for it in self.shortcuts if query in it["name"].lower()]
+        return self._sort_items(matches)
+
+    def _breadcrumb_chain_for(self, folder_id: str | None) -> list[tuple[str, str | None]]:
+        by_id = {it["id"]: it for it in self.shortcuts}
+        chain: list[tuple[str, str | None]] = []
+        current = folder_id
+        guard = 0
+        while current is not None and guard < 200:
+            node = by_id.get(current)
+            if node is None:
+                break
+            chain.append((node["name"], node["id"]))
+            current = node["parent_id"]
+            guard += 1
+        chain.reverse()
+        return [("Inicio", None)] + chain
+
+    def _path_to_item(self, item: dict) -> str:
+        chain = self._breadcrumb_chain_for(item.get("parent_id"))
+        return "En: " + " › ".join(name for name, _ in chain)
 
     # -- selección ------------------------------------------------------
 
@@ -1214,7 +1301,12 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event) -> None:
         key = event.key()
         ordered = self._tiles
-        if key == Qt.Key_Escape:
+        if event.modifiers() & Qt.ControlModifier and key == Qt.Key_F:
+            self.search_box.setFocus()
+            self.search_box.selectAll()
+        elif key == Qt.Key_Escape and self.search_query:
+            self.search_box.clear()
+        elif key == Qt.Key_Escape:
             self.selected_ids = set()
             self._refresh_selection_visuals()
         elif key in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected_ids:
