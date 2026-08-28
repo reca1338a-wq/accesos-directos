@@ -9,7 +9,7 @@ from PyInstaller.utils.hooks import collect_data_files
 # platform plugin windows") a veces no se detectan solos según la
 # versión de PyInstaller/PySide6 — collect_data_files los fuerza a
 # incluirse siempre, por seguridad.
-datas = [('VERSION', '.')]
+datas = [('VERSION', '.'), ('icon.ico', '.')]
 try:
     datas += collect_data_files('PySide6', includes=['plugins/platforms/*', 'plugins/styles/*'])
 except Exception:
@@ -46,7 +46,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='/home/manuel/Imágenes/icono.ico',
+    icon='icon.ico',
 )
 
 # COLLECT (en vez de meter a.binaries/a.datas en el EXE de arriba) es lo

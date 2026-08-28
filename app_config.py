@@ -23,6 +23,7 @@ def _get_app_dir() -> Path:
 
 APP_DIR = _get_app_dir()
 VERSION_FILE = APP_DIR / "VERSION"
+ICON_FILE = APP_DIR / "icon.ico"
 LEGACY_SHORTCUTS_PATH = APP_DIR / "shortcuts.json"
 
 # Repositorio de GitHub usado para comprobar actualizaciones.
@@ -365,7 +366,7 @@ def _normalize_items(raw: list) -> list[dict]:
             continue
 
         item_type = entry.get("type", "shortcut")
-        if item_type not in ("shortcut", "folder"):
+        if item_type not in ("shortcut", "folder", "url"):
             continue
 
         name = str(entry.get("name", "")).strip()
@@ -437,6 +438,13 @@ def _normalize_items(raw: list) -> list[dict]:
             if not path:
                 continue
             item["path"] = path
+        elif item_type == "url":
+            url = str(entry.get("url", "")).strip()
+            if not url:
+                continue
+            if "://" not in url:
+                url = "https://" + url
+            item["url"] = url
 
         items.append(item)
 

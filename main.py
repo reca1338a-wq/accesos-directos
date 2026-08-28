@@ -32,9 +32,10 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QCursor, QDrag, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QDrag, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -60,6 +61,10 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QRubberBand,
     QScrollArea,
+    QSplitter,
+    QSystemTrayIcon,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -69,6 +74,7 @@ from app_config import (
     DEFAULT_PATH_DISPLAY,
     DEFAULT_SIZE,
     GRID_SNAP_STEP,
+    ICON_FILE,
     MAX_TILE_HEIGHT,
     MAX_TILE_WIDTH,
     MIN_TILE_HEIGHT,
@@ -127,6 +133,11 @@ def open_path(path: str) -> None:
         os.system(f'open "{target}"')  # noqa: S605
     else:
         os.system(f'xdg-open "{target}"')  # noqa: S605
+
+
+def open_url(url: str) -> None:
+    if not QDesktopServices.openUrl(QUrl(url)):
+        raise OSError(f"No se pudo abrir la URL: {url}")
 
 
 def pil_to_pixmap(image) -> QPixmap:
@@ -314,6 +325,7 @@ class TileWidget(QFrame):
             and not Path(expand_path(item["path"])).expanduser().exists()
         )
         self._is_broken = is_broken
+        self._is_url = item["type"] == "url"
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -356,7 +368,9 @@ class TileWidget(QFrame):
             if pixmap is not None:
                 icon_label.setPixmap(pixmap)
             else:
-                icon_label.setText("⚠️" if is_broken else ("📁" if item["type"] == "folder" else "📄"))
+                icon_label.setText(
+                    "⚠️" if is_broken else ("🌐" if self._is_url else ("📁" if item["type"] == "folder" else "📄"))
+                )
                 icon_label.setFont(QFont("Segoe UI Emoji", 12))
             layout.addWidget(icon_label)
 
@@ -379,7 +393,9 @@ class TileWidget(QFrame):
         if pixmap is not None:
             icon_label.setPixmap(pixmap)
         else:
-            icon_label.setText("⚠️" if is_broken else ("📁" if item["type"] == "folder" else "📄"))
+            icon_label.setText(
+                "⚠️" if is_broken else ("🌐" if self._is_url else ("📁" if item["type"] == "folder" else "📄"))
+            )
             icon_label.setFont(QFont("Segoe UI Emoji", 20))
         layout.addWidget(icon_label)
 
@@ -397,6 +413,7 @@ class TileWidget(QFrame):
             self.subtitle_override is not None
             or self.item["type"] == "folder"
             or self._is_broken
+            or self._is_url
             or self._path_display_mode in ("always", "on_select")
         )
         if needs_subtitle_widget:
@@ -494,7 +511,7 @@ class TileWidget(QFrame):
             image = win_icons.compose_folder_icon(preview_paths, size=icon_px)
             return pil_to_pixmap(image) if image is not None else None
 
-        if self._is_broken:
+        if self._is_broken or self._is_url:
             return None
         image = win_icons.get_icon_image(expand_path(self.item.get("path", "")), icon_px)
         return pil_to_pixmap(image) if image is not None else None
@@ -502,6 +519,8 @@ class TileWidget(QFrame):
     def _path_text(self) -> str:
         """Ruta original ya acortada (con `~` para la carpeta personal),
         sin tener en cuenta el modo de visualización elegido en ajustes."""
+        if self._is_url:
+            return self.item.get("url", "")
         home = str(Path.home())
         path = self.item.get("path", "")
         return "~" + path[len(home):] if path.startswith(home) else path
@@ -514,6 +533,8 @@ class TileWidget(QFrame):
             return f"{count} elemento" + ("" if count == 1 else "s")
         if self._is_broken:
             return "⚠ No se encuentra"
+        if self._is_url:
+            return self._path_text()
         if self._path_display_mode == "never":
             return ""
         if self._path_display_mode == "on_select":
@@ -881,6 +902,11 @@ class MainWindow(QMainWindow):
         self.resize(820, 600)
         self.setMinimumSize(480, 360)
         self.setFocusPolicy(Qt.StrongFocus)
+        self._app_icon = QIcon(str(ICON_FILE)) if ICON_FILE.exists() else self.style().standardIcon(
+            self.style().StandardPixmap.SP_ComputerIcon
+        )
+        self.setWindowIcon(self._app_icon)
+        self._really_quit = False
         geometry = self.settings.get("window_geometry", "")
         if geometry:
             try:
@@ -891,6 +917,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_theme()
         self.refresh()
+        self._build_tray_icon()
 
         # -- actualizaciones --------------------------------------------
         cleanup_stale_update_files()
@@ -905,6 +932,36 @@ class MainWindow(QMainWindow):
         self._update_timer.timeout.connect(lambda: self.check_updates_dialog(manual=False))
         self._update_timer.start(15 * 60 * 1000)
 
+    def _build_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = None
+            return
+
+        self._tray_icon = QSystemTrayIcon(self._app_icon, self)
+        self._tray_icon.setToolTip("Accesos Directos")
+
+        menu = QMenu(self)
+        menu.addAction("Abrir Accesos Directos", self._restore_from_tray)
+        menu.addSeparator()
+        menu.addAction("Salir", self._quit_from_tray)
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._really_quit = True
+        self.close()
+        QApplication.instance().quit()
+
     def closeEvent(self, event) -> None:
         try:
             geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
@@ -912,6 +969,27 @@ class MainWindow(QMainWindow):
             save_settings(self.settings)
         except Exception:
             pass
+
+        # Al pulsar la X, se minimiza a la bandeja en vez de cerrarse del
+        # todo (solo si hay bandeja disponible); "Salir" desde el menú de
+        # la bandeja es lo único que cierra la app de verdad.
+        if not self._really_quit and self._tray_icon is not None:
+            event.ignore()
+            self.hide()
+            if not self.settings.get("_tray_notice_shown"):
+                self._tray_icon.showMessage(
+                    "Accesos Directos sigue abierto",
+                    "Se ha minimizado a la bandeja del sistema. Haz clic en el icono para volver a "
+                    'abrirlo, o usa "Salir" desde ahí para cerrarlo del todo.',
+                    self._app_icon,
+                    4000,
+                )
+                self.settings["_tray_notice_shown"] = True
+                save_settings(self.settings)
+            return
+
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
         super().closeEvent(event)
 
     # -- construcción --------------------------------------------------
@@ -1024,6 +1102,20 @@ class MainWindow(QMainWindow):
 
         toolbar_row2.addStretch()
 
+        health_button = QPushButton("🩺")
+        health_button.setObjectName("ghostButton")
+        health_button.setCursor(QCursor(Qt.PointingHandCursor))
+        health_button.setToolTip("Comprobar salud de todos los accesos")
+        health_button.clicked.connect(self.open_health_check_dialog)
+        toolbar_row2.addWidget(health_button)
+
+        sidebar_button = QPushButton("🌳")
+        sidebar_button.setObjectName("ghostButton")
+        sidebar_button.setCursor(QCursor(Qt.PointingHandCursor))
+        sidebar_button.setToolTip("Mostrar/ocultar árbol de carpetas")
+        sidebar_button.clicked.connect(self.toggle_sidebar)
+        toolbar_row2.addWidget(sidebar_button)
+
         trash_button = QPushButton("🗑")
         trash_button.setObjectName("ghostButton")
         trash_button.setCursor(QCursor(Qt.PointingHandCursor))
@@ -1060,7 +1152,28 @@ class MainWindow(QMainWindow):
         self._sections_layout.setSpacing(20)
 
         self.scroll_area.setWidget(self.grid_container)
-        root_layout.addWidget(self.scroll_area, stretch=1)
+
+        # Árbol lateral de carpetas (como el Explorador), alternativa a
+        # navegar carpeta a carpeta con la cuadrícula. Oculto por defecto
+        # (se guarda la preferencia); el botón 🌳 lo muestra/oculta.
+        self.sidebar_tree = QTreeWidget()
+        self.sidebar_tree.setObjectName("sidebarTree")
+        self.sidebar_tree.setHeaderHidden(True)
+        self.sidebar_tree.setMinimumWidth(150)
+        self.sidebar_tree.setMaximumWidth(320)
+        self.sidebar_tree.itemClicked.connect(self._on_sidebar_item_clicked)
+
+        self._content_splitter = QSplitter(Qt.Horizontal)
+        self._content_splitter.setObjectName("contentSplitter")
+        self._content_splitter.setChildrenCollapsible(False)
+        self._content_splitter.addWidget(self.sidebar_tree)
+        self._content_splitter.addWidget(self.scroll_area)
+        self._content_splitter.setStretchFactor(0, 0)
+        self._content_splitter.setStretchFactor(1, 1)
+        self._content_splitter.setSizes([200, 700])
+        self.sidebar_tree.setVisible(bool(self.settings.get("sidebar_visible", False)))
+
+        root_layout.addWidget(self._content_splitter, stretch=1)
 
         # Línea de inserción: se muestra/mueve durante el arrastre para
         # dejar claro dónde va a caer la tarjeta, en vez de tener que
@@ -1124,6 +1237,17 @@ class MainWindow(QMainWindow):
             QWidget#central {{ background: {c['bg']}; }}
             QScrollArea#scrollArea {{ background: transparent; border: none; }}
             QWidget#gridContainer {{ background: transparent; }}
+            QSplitter#contentSplitter::handle {{ background: {c['surface']}; width: 2px; }}
+            QSplitter#contentSplitter::handle:hover {{ background: {c['accent']}; }}
+            QTreeWidget#sidebarTree {{
+                background: transparent; border: none; color: {c['text']}; font-size: 12px;
+                outline: none;
+            }}
+            QTreeWidget#sidebarTree::item {{ padding: 4px 2px; border-radius: 6px; }}
+            QTreeWidget#sidebarTree::item:hover {{ background: {c['surface']}; }}
+            QTreeWidget#sidebarTree::item:selected {{
+                background: {c['surface_hover']}; color: {c['accent']};
+            }}
             QLabel#title {{
                 color: {c['accent']}; font-size: 22px; font-weight: 700;
                 font-family: 'Segoe UI'; margin-right: 8px;
@@ -1277,6 +1401,66 @@ class MainWindow(QMainWindow):
             self.search_box.blockSignals(False)
         self.refresh()
 
+    def toggle_sidebar(self) -> None:
+        visible = not self.sidebar_tree.isVisible()
+        self.sidebar_tree.setVisible(visible)
+        self.settings["sidebar_visible"] = visible
+        save_settings(self.settings)
+
+    def _populate_sidebar(self) -> None:
+        self.sidebar_tree.blockSignals(True)
+        self.sidebar_tree.clear()
+
+        root_item = QTreeWidgetItem(["🏠  Inicio"])
+        root_item.setData(0, Qt.ItemDataRole.UserRole, None)
+        self.sidebar_tree.addTopLevelItem(root_item)
+
+        by_parent: dict[str | None, list[dict]] = {}
+        for it in self.shortcuts:
+            if it["type"] == "folder":
+                by_parent.setdefault(it["parent_id"], []).append(it)
+        for children in by_parent.values():
+            children.sort(key=lambda it: it["name"].casefold())
+
+        def add_children(parent_widget_item: QTreeWidgetItem, folder_id: str | None) -> None:
+            for folder in by_parent.get(folder_id, []):
+                node = QTreeWidgetItem([f"📁  {folder['name']}"])
+                node.setData(0, Qt.ItemDataRole.UserRole, folder["id"])
+                parent_widget_item.addChild(node)
+                add_children(node, folder["id"])
+
+        add_children(root_item, None)
+        self.sidebar_tree.expandAll()
+
+        def find(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            if item.data(0, Qt.ItemDataRole.UserRole) == self.current_folder_id:
+                return item
+            for i in range(item.childCount()):
+                found = find(item.child(i))
+                if found is not None:
+                    return found
+            return None
+
+        target = find(root_item)
+        if target is not None:
+            self.sidebar_tree.setCurrentItem(target)
+        self.sidebar_tree.blockSignals(False)
+
+    def _on_sidebar_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        folder_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if folder_id == self.current_folder_id:
+            return
+        self.breadcrumb = self._breadcrumb_chain_for(folder_id) if folder_id else [("Inicio", None)]
+        self.current_folder_id = folder_id
+        self.category_filter = None
+        self.selected_ids = set()
+        if self.search_query:
+            self.search_query = ""
+            self.search_box.blockSignals(True)
+            self.search_box.clear()
+            self.search_box.blockSignals(False)
+        self.refresh()
+
     def refresh(self) -> None:
         while self._sections_layout.count():
             layout_item = self._sections_layout.takeAt(0)
@@ -1290,6 +1474,7 @@ class MainWindow(QMainWindow):
         self._tile_by_id = {}
         self._flow_sections = []
         compact = self.settings.get("card_style") == "compact"
+        self._populate_sidebar()
 
         if self.search_query:
             self.breadcrumb_row.hide()
@@ -1414,7 +1599,10 @@ class MainWindow(QMainWindow):
             self.refresh()
             return
         try:
-            open_path(item["path"])
+            if item["type"] == "url":
+                open_url(item["url"])
+            else:
+                open_path(item["path"])
         except FileNotFoundError as exc:
             QMessageBox.warning(self, "Archivo no encontrado", str(exc))
         except OSError as exc:
@@ -1973,6 +2161,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(scroll, stretch=1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Cerrar")
         buttons.rejected.connect(dialog.close)
         buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
         layout.addWidget(buttons)
@@ -2015,6 +2204,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(scroll, stretch=1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Cerrar")
         buttons.rejected.connect(dialog.close)
         buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
         layout.addWidget(buttons)
@@ -2064,8 +2254,40 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("📄  Acceso a un archivo", self.add_file_shortcut)
         menu.addAction("📁  Acceso a una carpeta del sistema", self.add_folder_shortcut)
+        menu.addAction("🌐  Acceso a una URL", self.add_url_shortcut)
         menu.addAction("🗂  Carpeta para organizar", self.add_internal_folder)
         menu.exec(QCursor.pos())
+
+    def add_url_shortcut(self) -> None:
+        url, ok = QInputDialog.getText(self, "Añadir URL", "Dirección web (ej. github.com):")
+        url = url.strip()
+        if not ok or not url:
+            return
+        if "://" not in url:
+            url = "https://" + url
+        default_name = QUrl(url).host() or url
+        name, ok = QInputDialog.getText(self, "Nombre del acceso", "Nombre:", text=default_name)
+        if not ok or not name.strip():
+            return
+        self.push_undo("añadir")
+        siblings = [it for it in self.shortcuts if it["parent_id"] == self.current_folder_id]
+        self.shortcuts.append({
+            "id": new_item_id(),
+            "type": "url",
+            "name": name.strip(),
+            "url": url,
+            "parent_id": self.current_folder_id,
+            "order": len(siblings),
+            "color": None,
+            "size": DEFAULT_SIZE,
+            "width": None,
+            "height": None,
+            "category": None,
+            "open_count": 0,
+            "last_opened": 0.0,
+        })
+        save_shortcuts(self.shortcuts)
+        self.refresh()
 
     def add_file_shortcut(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Selecciona un archivo", str(Path.home()))
@@ -2319,6 +2541,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(new_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Cerrar")
         buttons.rejected.connect(dialog.close)
         buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
         layout.addWidget(buttons)
@@ -2438,6 +2661,113 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         dialog.exec()
 
+    def _repair_shortcut_path(self, item: dict) -> None:
+        new_path, _ = QFileDialog.getOpenFileName(
+            self, f"Indica la nueva ubicación de «{item['name']}»", str(Path.home())
+        )
+        if not new_path:
+            new_path = QFileDialog.getExistingDirectory(
+                self, f"...o selecciona una carpeta si «{item['name']}» era una carpeta", str(Path.home())
+            )
+        if not new_path:
+            return
+        self.push_undo("editar")
+        item["path"] = portabilize_path(new_path)
+        save_shortcuts(self.shortcuts)
+        self.refresh()
+
+    def _trash_icon_pixmap(self, entry: dict) -> QPixmap | None:
+        if entry["type"] != "shortcut":
+            return None
+        path = entry.get("path", "")
+        if not path or not Path(expand_path(path)).expanduser().exists():
+            return None
+        image = win_icons.get_icon_image(expand_path(path), 20)
+        return pil_to_pixmap(image) if image is not None else None
+
+    def open_health_check_dialog(self) -> None:
+        broken: list[dict] = []
+        for it in self.shortcuts:
+            if it["type"] != "shortcut":
+                continue
+            path = it.get("path", "")
+            if not path or not Path(expand_path(path)).expanduser().exists():
+                broken.append(it)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Comprobación de salud")
+        dialog.resize(460, 440)
+        layout = QVBoxLayout(dialog)
+
+        total = sum(1 for it in self.shortcuts if it["type"] == "shortcut")
+        summary = (
+            f"✅ Revisados {total} accesos a archivos/carpetas: todos funcionan."
+            if not broken
+            else f"⚠ {len(broken)} de {total} accesos a archivos/carpetas están rotos (ya no existen)."
+        )
+        summary_label = QLabel(summary)
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+
+        if broken:
+            rows_container = QWidget()
+            rows_layout = QVBoxLayout(rows_container)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(rows_container)
+            layout.addWidget(scroll, stretch=1)
+
+            def go_to(item: dict) -> None:
+                dialog.close()
+                self.search_box.clear()
+                self.breadcrumb = self._breadcrumb_chain_for(item["parent_id"])
+                self.current_folder_id = item["parent_id"]
+                self.category_filter = None
+                self.refresh()
+
+            def remove_broken(item: dict) -> None:
+                before = len(self.shortcuts)
+                self._delete_items([item])
+                if len(self.shortcuts) < before:  # el usuario confirmó el borrado
+                    broken.remove(item)
+                    render_rows()
+
+            def render_rows() -> None:
+                while rows_layout.count():
+                    row_item = rows_layout.takeAt(0)
+                    if row_item.widget() is not None:
+                        row_item.widget().hide()
+                        row_item.widget().deleteLater()
+                for it in broken:
+                    row_widget = QWidget()
+                    row = QHBoxLayout(row_widget)
+                    row.setContentsMargins(0, 0, 0, 0)
+                    location = self._path_to_item(it)
+                    text = QLabel(f"⚠ {it['name']}\n{location}")
+                    text.setStyleSheet(f"color: {self.colors['text_muted']}; font-size: 10px;")
+                    row.addWidget(text, stretch=1)
+                    goto_btn = QPushButton("Ir")
+                    goto_btn.clicked.connect(lambda _c=False, i=it: go_to(i))
+                    row.addWidget(goto_btn)
+                    repair_btn = QPushButton("Reparar...")
+                    repair_btn.clicked.connect(lambda _c=False, i=it: (dialog.close(), self._repair_shortcut_path(i)))
+                    row.addWidget(repair_btn)
+                    remove_btn = QPushButton("Quitar")
+                    remove_btn.clicked.connect(lambda _c=False, i=it: remove_broken(i))
+                    row.addWidget(remove_btn)
+                    rows_layout.addWidget(row_widget)
+                rows_layout.addStretch()
+
+            render_rows()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Cerrar")
+        buttons.rejected.connect(dialog.close)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.exec()
+        self.refresh()
+
     def open_trash_dialog(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Papelera")
@@ -2469,8 +2799,21 @@ class MainWindow(QMainWindow):
                 row_widget = QWidget()
                 row = QHBoxLayout(row_widget)
                 row.setContentsMargins(0, 0, 0, 0)
-                icon = "📁" if entry["type"] == "folder" else "📄"
-                row.addWidget(QLabel(f"{icon} {entry['name']}"), stretch=1)
+
+                icon_label = QLabel()
+                icon_label.setFixedSize(22, 22)
+                icon_label.setAlignment(Qt.AlignCenter)
+                pixmap = self._trash_icon_pixmap(entry)
+                if pixmap is not None:
+                    icon_label.setPixmap(pixmap)
+                else:
+                    icon_label.setText(
+                        "🌐" if entry["type"] == "url" else ("📁" if entry["type"] == "folder" else "📄")
+                    )
+                    icon_label.setFont(QFont("Segoe UI Emoji", 12))
+                row.addWidget(icon_label)
+
+                row.addWidget(QLabel(entry["name"]), stretch=1)
                 restore_btn = QPushButton("Restaurar")
                 restore_btn.clicked.connect(lambda _c=False, e=entry: restore_entry(e))
                 row.addWidget(restore_btn)
@@ -2614,6 +2957,9 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setQuitOnLastWindowClosed(False)
+    if ICON_FILE.exists():
+        app.setWindowIcon(QIcon(str(ICON_FILE)))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
