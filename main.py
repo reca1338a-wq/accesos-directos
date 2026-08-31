@@ -36,6 +36,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QDrag, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -119,6 +120,27 @@ from github_updates import (
 # mover a una carpeta). Los archivos arrastrados desde el Explorador usan
 # el tipo estándar "text/uri-list", que Qt ya entiende solo.
 MIME_ITEM_IDS = "application/x-accesos-directos-ids"
+
+
+# Identificador fijo del "socket" de instancia única. Si ya existe una
+# instancia escuchando en este nombre, significa que la app ya está
+# abierta (aunque esté minimizada en la bandeja) — ver _try_activate_running_instance.
+SINGLE_INSTANCE_KEY = "AccesosDirectos-SingleInstance-v1"
+
+
+def _try_activate_running_instance() -> bool:
+    """Si ya hay una instancia de la app corriendo, le pide que se muestre
+    y devuelve True (para que esta copia nueva no llegue a abrir ventana
+    ni icono de bandeja propios, evitando la duplicación). Devuelve False
+    si esta es la primera instancia y debe arrancar con normalidad."""
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_KEY)
+    if socket.waitForConnected(200):
+        socket.write(b"show")
+        socket.waitForBytesWritten(200)
+        socket.disconnectFromServer()
+        return True
+    return False
 
 
 def open_path(path: str) -> None:
@@ -918,6 +940,7 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self.refresh()
         self._build_tray_icon()
+        self._start_single_instance_server()
 
         # -- actualizaciones --------------------------------------------
         cleanup_stale_update_files()
@@ -931,6 +954,22 @@ class MainWindow(QMainWindow):
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(lambda: self.check_updates_dialog(manual=False))
         self._update_timer.start(15 * 60 * 1000)
+
+    def _start_single_instance_server(self) -> None:
+        # Limpia un "socket" huérfano si la app se cerró de forma brusca
+        # la vez anterior (ver documentación de Qt para QLocalServer) —
+        # si no se hace esto, un listen() tras un cierre así podría
+        # fallar y dejar que se cuelen instancias duplicadas de todos modos.
+        QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+        self._instance_server = QLocalServer(self)
+        self._instance_server.newConnection.connect(self._on_second_instance_launch)
+        self._instance_server.listen(SINGLE_INSTANCE_KEY)
+
+    def _on_second_instance_launch(self) -> None:
+        socket = self._instance_server.nextPendingConnection()
+        if socket is not None:
+            socket.readyRead.connect(socket.deleteLater)
+        self._restore_from_tray()
 
     def _build_tray_icon(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -976,7 +1015,7 @@ class MainWindow(QMainWindow):
         if not self._really_quit and self._tray_icon is not None:
             event.ignore()
             self.hide()
-            if not self.settings.get("_tray_notice_shown"):
+            if not self.settings.get("tray_notice_shown"):
                 self._tray_icon.showMessage(
                     "Accesos Directos sigue abierto",
                     "Se ha minimizado a la bandeja del sistema. Haz clic en el icono para volver a "
@@ -984,12 +1023,14 @@ class MainWindow(QMainWindow):
                     self._app_icon,
                     4000,
                 )
-                self.settings["_tray_notice_shown"] = True
+                self.settings["tray_notice_shown"] = True
                 save_settings(self.settings)
             return
 
         if self._tray_icon is not None:
             self._tray_icon.hide()
+        if self._instance_server is not None:
+            self._instance_server.close()
         super().closeEvent(event)
 
     # -- construcción --------------------------------------------------
@@ -2960,6 +3001,14 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(False)
     if ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(ICON_FILE)))
+
+    if _try_activate_running_instance():
+        # Ya había una copia abierta (minimizada en la bandeja o no): le
+        # hemos pedido que se muestre y esta copia nueva termina aquí,
+        # sin llegar a crear ventana ni icono de bandeja propios — así
+        # se evita la duplicación en la flechita de Windows.
+        return
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

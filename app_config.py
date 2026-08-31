@@ -124,6 +124,8 @@ DEFAULT_SETTINGS = {
     "snap_to_grid": True,
     # Ver PATH_DISPLAY_MODES arriba.
     "path_display": DEFAULT_PATH_DISPLAY,
+    "sidebar_visible": False,
+    "tray_notice_shown": False,
 }
 
 DEFAULT_SHORTCUTS = [
@@ -202,6 +204,21 @@ def ensure_user_data_dir() -> None:
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# Validadores por ajuste: cuando un valor guardado no es válido (ej. un
+# tema que ya no existe), se usa el valor por defecto en su lugar. Los
+# ajustes que no aparecen aquí se cargan tal cual, solo forzando el mismo
+# tipo (bool/str/...) que su valor por defecto.
+_SETTINGS_VALIDATORS = {
+    "click_mode": lambda v: v if v in ("single", "double") else DEFAULT_SETTINGS["click_mode"],
+    "theme": lambda v: v if v in THEMES else DEFAULT_THEME,
+    "sort_mode": lambda v: v if v in SORT_MODES else "manual",
+    "card_style": lambda v: v if v in ("cards", "compact") else "cards",
+    "path_display": lambda v: v if v in PATH_DISPLAY_MODES else DEFAULT_PATH_DISPLAY,
+    "categories": lambda v: {str(k): str(x) for k, x in v.items()} if isinstance(v, dict) else {},
+    "window_geometry": lambda v: str(v) if isinstance(v, str) else "",
+}
+
+
 def load_settings() -> dict:
     ensure_user_data_dir()
     if not SETTINGS_PATH.exists():
@@ -211,31 +228,23 @@ def load_settings() -> dict:
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         data = json.load(handle)
 
+    # Recorremos DEFAULT_SETTINGS (no `data`) para que cualquier ajuste
+    # nuevo que se añada en el futuro se cargue solo en cuanto se declare
+    # ahí arriba, sin tener que acordarse de añadir también una línea aquí
+    # (así es como sidebar_visible se quedó "guardándose pero sin
+    # recuperarse nunca" la primera vez).
     merged = json.loads(json.dumps(DEFAULT_SETTINGS))
-    merged["auto_check_updates"] = bool(
-        data.get("auto_check_updates", DEFAULT_SETTINGS["auto_check_updates"])
-    )
-    click_mode = data.get("click_mode", DEFAULT_SETTINGS["click_mode"])
-    merged["click_mode"] = click_mode if click_mode in ("single", "double") else "double"
-    theme = data.get("theme", DEFAULT_SETTINGS["theme"])
-    merged["theme"] = theme if theme in THEMES else DEFAULT_THEME
-    sort_mode = data.get("sort_mode", DEFAULT_SETTINGS["sort_mode"])
-    merged["sort_mode"] = sort_mode if sort_mode in SORT_MODES else "manual"
-    card_style = data.get("card_style", DEFAULT_SETTINGS["card_style"])
-    merged["card_style"] = card_style if card_style in ("cards", "compact") else "cards"
-    merged["show_recent"] = bool(data.get("show_recent", DEFAULT_SETTINGS["show_recent"]))
-    merged["group_by_category"] = bool(
-        data.get("group_by_category", DEFAULT_SETTINGS["group_by_category"])
-    )
-    geometry = data.get("window_geometry", "")
-    merged["window_geometry"] = str(geometry) if isinstance(geometry, str) else ""
-    merged["snap_to_grid"] = bool(data.get("snap_to_grid", DEFAULT_SETTINGS["snap_to_grid"]))
-    path_display = data.get("path_display", DEFAULT_PATH_DISPLAY)
-    merged["path_display"] = path_display if path_display in PATH_DISPLAY_MODES else DEFAULT_PATH_DISPLAY
-    categories = data.get("categories", {})
-    merged["categories"] = (
-        {str(k): str(v) for k, v in categories.items()} if isinstance(categories, dict) else {}
-    )
+    for key, default_value in DEFAULT_SETTINGS.items():
+        if key not in data:
+            continue
+        value = data[key]
+        validator = _SETTINGS_VALIDATORS.get(key)
+        if validator is not None:
+            merged[key] = validator(value)
+        elif isinstance(default_value, bool):
+            merged[key] = bool(value)
+        else:
+            merged[key] = value
     return merged
 
 
