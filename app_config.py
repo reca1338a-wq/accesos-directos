@@ -41,6 +41,8 @@ else:
 SHORTCUTS_PATH = USER_DATA_DIR / "shortcuts.json"
 SETTINGS_PATH = USER_DATA_DIR / "settings.json"
 TRASH_PATH = USER_DATA_DIR / "trash.json"
+LOG_FILE = USER_DATA_DIR / "log.txt"
+LOG_MAX_BYTES = 1_000_000  # ~1 MB; se rota (se guarda una copia .1) al superarlo.
 
 # Días que se conserva un elemento en la papelera antes de borrarse
 # definitivamente en solitario (al arrancar la app).
@@ -126,6 +128,12 @@ DEFAULT_SETTINGS = {
     "path_display": DEFAULT_PATH_DISPLAY,
     "sidebar_visible": False,
     "tray_notice_shown": False,
+    # Si se inicia con Windows (ver startup_supported/set_startup_enabled),
+    # controla si arranca ya minimizado en la bandeja o mostrando la ventana.
+    "start_minimized": False,
+    # Avisar con un globo de la bandeja si la comprobación de salud, al
+    # arrancar, encuentra accesos rotos.
+    "notify_broken_links": True,
 }
 
 DEFAULT_SHORTCUTS = [
@@ -186,10 +194,33 @@ def most_used_items(items: list[dict], limit: int = 10) -> list[dict]:
     abierto."""
     used = [
         it for it in items
-        if it["type"] == "shortcut" and int(it.get("open_count", 0) or 0) > 0
+        if it["type"] in ("shortcut", "url") and int(it.get("open_count", 0) or 0) > 0
     ]
     used.sort(key=lambda it: (-int(it.get("open_count", 0) or 0), -(it.get("last_opened") or 0)))
     return used[:limit]
+
+
+def recent_items(items: list[dict], limit: int = 15) -> list[dict]:
+    """Devuelve hasta `limit` accesos (no carpetas) ordenados por la
+    última vez que se abrieron, del más reciente al más antiguo. A
+    diferencia de most_used_items (frecuencia), esto es un historial real
+    por orden cronológico. Ignora los que nunca se han abierto."""
+    used = [
+        it for it in items
+        if it["type"] in ("shortcut", "url") and (it.get("last_opened") or 0) > 0
+    ]
+    used.sort(key=lambda it: -(it.get("last_opened") or 0))
+    return used[:limit]
+
+
+def known_urls(items: list[dict]) -> list[str]:
+    """Direcciones ya usadas en otros accesos de tipo url, sin repetir,
+    para sugerirlas con autocompletado al añadir una nueva."""
+    seen: list[str] = []
+    for it in items:
+        if it["type"] == "url" and it.get("url") and it["url"] not in seen:
+            seen.append(it["url"])
+    return seen
 
 
 def favorite_items(items: list[dict]) -> list[dict]:
@@ -266,18 +297,25 @@ def save_settings(settings: dict) -> None:
 STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "AccesosDirectos"
 
+# Se añade al comando de arranque con Windows cuando el usuario elige
+# "Iniciar minimizado" — main.py comprueba sys.argv al arrancar y, si
+# está presente, se salta el window.show() inicial (la app abre
+# directamente en la bandeja, sin mostrar la ventana).
+START_MINIMIZED_FLAG = "--start-minimized"
 
-def _startup_command() -> str:
+
+def _startup_command(minimized: bool = False) -> str:
+    suffix = f" {START_MINIMIZED_FLAG}" if minimized else ""
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable).resolve()
-        return f'"{exe}"'
+        return f'"{exe}"{suffix}'
     # Modo fuente (sin compilar): usa pythonw.exe para que no abra una
     # consola al arrancar con Windows.
     python_dir = Path(sys.executable).resolve().parent
     pythonw = python_dir / "pythonw.exe"
     interpreter = pythonw if pythonw.exists() else Path(sys.executable).resolve()
     script = (APP_DIR / "main.py").resolve()
-    return f'"{interpreter}" "{script}"'
+    return f'"{interpreter}" "{script}"{suffix}'
 
 
 def startup_supported() -> bool:
@@ -297,7 +335,7 @@ def is_startup_enabled() -> bool:
         return False
 
 
-def set_startup_enabled(enabled: bool) -> None:
+def set_startup_enabled(enabled: bool, minimized: bool = False) -> None:
     if not startup_supported():
         return
     import winreg
@@ -306,7 +344,7 @@ def set_startup_enabled(enabled: bool) -> None:
         winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
     ) as key:
         if enabled:
-            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
+            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command(minimized))
         else:
             try:
                 winreg.DeleteValue(key, STARTUP_VALUE_NAME)
@@ -661,26 +699,55 @@ def parse_shortcuts_file(path: Path) -> list[dict]:
     return _normalize_items(_extract_raw_items(data))
 
 
-def export_shortcuts(items: list[dict], destination: Path) -> None:
+def export_shortcuts(items: list[dict], destination: Path, categories: dict | None = None) -> None:
     normalized = _normalize_items(items)
+    payload = {"items": normalized}
+    # Las categorías (nombre -> color) viven en settings.json, no en cada
+    # elemento, así que si no se incluyen aquí aparte, un acceso exportado
+    # con categoría "Trabajo" llegaría a otro PC sin saber de qué color
+    # pintar esa franja.
+    if categories:
+        payload["categories"] = dict(categories)
     with destination.open("w", encoding="utf-8") as handle:
-        json.dump({"items": normalized}, handle, indent=2, ensure_ascii=False)
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
 
 
-def import_shortcuts(source: Path, mode: str) -> list[dict]:
+def import_shortcuts(
+    source: Path, mode: str, existing_categories: dict | None = None
+) -> tuple[list[dict], dict]:
+    """Devuelve (accesos_resultantes, categorías_resultantes). Las
+    categorías del archivo importado se fusionan con las que ya había:
+    los nombres nuevos se añaden con su color; los que ya existían
+    localmente conservan el color que ya tenías (no se sobrescribe)."""
+    with source.open(encoding="utf-8") as handle:
+        raw_data = json.load(handle)
+    imported_categories = raw_data.get("categories", {}) if isinstance(raw_data, dict) else {}
+    imported_categories = (
+        {str(k): str(v) for k, v in imported_categories.items()}
+        if isinstance(imported_categories, dict)
+        else {}
+    )
+
+    merged_categories = dict(existing_categories or {})
+    for name, color in imported_categories.items():
+        merged_categories.setdefault(name, color)
+
     imported = parse_shortcuts_file(source)
     if mode == "replace":
         save_shortcuts(imported)
-        return imported
+        return imported, merged_categories
 
     current = load_shortcuts()
     existing_paths = {item["path"] for item in current if item["type"] == "shortcut"}
+    existing_urls = {item["url"] for item in current if item["type"] == "url"}
     merged = list(current)
     next_order = sum(1 for item in current if item["parent_id"] is None)
 
     for entry in imported:
         if entry["type"] == "shortcut" and entry["path"] in existing_paths:
+            continue
+        if entry["type"] == "url" and entry.get("url") in existing_urls:
             continue
         new_entry = dict(entry)
         new_entry["id"] = new_item_id()
@@ -690,6 +757,48 @@ def import_shortcuts(source: Path, mode: str) -> list[dict]:
         merged.append(new_entry)
         if new_entry["type"] == "shortcut":
             existing_paths.add(new_entry["path"])
+        elif new_entry["type"] == "url":
+            existing_urls.add(new_entry["url"])
 
     save_shortcuts(merged)
-    return merged
+    return merged, merged_categories
+
+
+# ---------------------------------------------------------------------------
+# Registro de errores en disco (log.txt), para poder diagnosticar fallos
+# sin depender de que alguien capture pantallazos del error. Con
+# --windowed (sin consola) es la única forma práctica de ver qué pasó.
+# ---------------------------------------------------------------------------
+
+
+def setup_logging():
+    """Configura el registro en archivo. Es seguro llamarla varias veces
+    (solo se configura de verdad la primera). Devuelve el logger."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    logger = logging.getLogger("accesos_directos")
+    if logger.handlers:
+        return logger
+
+    ensure_user_data_dir()
+    logger.setLevel(logging.INFO)
+    try:
+        handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=1, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(handler)
+    except OSError:
+        # Si por lo que sea no se puede escribir el archivo (permisos,
+        # disco lleno...), seguimos sin registro en vez de romper la app.
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+
+def get_logger():
+    import logging
+
+    return logging.getLogger("accesos_directos")

@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -76,6 +77,7 @@ from app_config import (
     DEFAULT_SIZE,
     GRID_SNAP_STEP,
     ICON_FILE,
+    LOG_FILE,
     MAX_TILE_HEIGHT,
     MAX_TILE_WIDTH,
     MIN_TILE_HEIGHT,
@@ -83,13 +85,18 @@ from app_config import (
     PATH_DISPLAY_MODES,
     SIZE_PRESETS,
     SORT_MODES,
+    START_MINIMIZED_FLAG,
     THEMES,
     USER_DATA_DIR,
+    export_shortcuts,
     expand_path,
     favorite_items,
     get_app_version,
+    get_logger,
     get_theme,
+    import_shortcuts,
     is_startup_enabled,
+    known_urls,
     load_settings,
     load_shortcuts,
     load_trash,
@@ -98,11 +105,13 @@ from app_config import (
     portabilize_path,
     purge_old_trash,
     record_item_opened,
+    recent_items,
     resolve_lnk_target,
     save_settings,
     save_shortcuts,
     save_trash,
     set_startup_enabled,
+    setup_logging,
     snap_dimension,
     startup_supported,
     TRASH_RETENTION_DAYS,
@@ -283,6 +292,37 @@ class _StarLabel(QLabel):
             event.accept()
             return
         super().mousePressEvent(event)
+
+
+class ClickableRow(QFrame):
+    """Fila sencilla (icono + nombre) que se resalta al pasar el ratón y
+    emite `clicked` al pulsarla — usada en diálogos tipo lista (Recientes,
+    etc.) para poder abrir el elemento directamente desde ahí."""
+
+    clicked = Signal()
+
+    def __init__(self, item: dict, colors: dict) -> None:
+        super().__init__()
+        self.item = item
+        self.setObjectName("clickableRow")
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(8)
+
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(20, 20)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        self.icon_label.setFont(QFont("Segoe UI Emoji", 12))
+        layout.addWidget(self.icon_label)
+
+        self.name_label = QLabel(item.get("name", ""))
+        layout.addWidget(self.name_label, stretch=1)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class TileWidget(QFrame):
@@ -955,6 +995,34 @@ class MainWindow(QMainWindow):
         self._update_timer.timeout.connect(lambda: self.check_updates_dialog(manual=False))
         self._update_timer.start(15 * 60 * 1000)
 
+        if self.settings.get("notify_broken_links", True):
+            QTimer.singleShot(4000, self._notify_broken_links_if_any)
+
+    def _notify_broken_links_if_any(self) -> None:
+        broken = self._find_broken_shortcuts()
+        if not broken:
+            return
+        get_logger().warning("Comprobación de salud al arrancar: %d acceso(s) roto(s).", len(broken))
+        if self._tray_icon is None:
+            return
+        plural = "" if len(broken) == 1 else "s"
+        try:
+            self._tray_icon.messageClicked.disconnect(self._on_broken_links_message_clicked)
+        except (RuntimeError, TypeError):
+            pass
+        self._tray_icon.messageClicked.connect(self._on_broken_links_message_clicked)
+        self._tray_icon.showMessage(
+            "Accesos Directos",
+            f"⚠ {len(broken)} acceso{plural} roto{plural} (ya no se encuentra{'n' if len(broken) != 1 else ''}). "
+            "Haz clic aquí para revisarlos.",
+            self._app_icon,
+            5000,
+        )
+
+    def _on_broken_links_message_clicked(self) -> None:
+        self._restore_from_tray()
+        self.open_health_check_dialog()
+
     def _start_single_instance_server(self) -> None:
         # Limpia un "socket" huérfano si la app se cerró de forma brusca
         # la vez anterior (ver documentación de Qt para QLocalServer) —
@@ -1127,35 +1195,7 @@ class MainWindow(QMainWindow):
         self.category_button.clicked.connect(self.show_category_menu)
         toolbar_row2.addWidget(self.category_button)
 
-        stats_button = QPushButton("📊  Más usados")
-        stats_button.setObjectName("ghostButton")
-        stats_button.setCursor(QCursor(Qt.PointingHandCursor))
-        stats_button.setToolTip("Estadísticas de uso")
-        stats_button.clicked.connect(self.open_usage_stats_dialog)
-        toolbar_row2.addWidget(stats_button)
-
-        favorites_button = QPushButton("⭐  Favoritos")
-        favorites_button.setObjectName("ghostButton")
-        favorites_button.setCursor(QCursor(Qt.PointingHandCursor))
-        favorites_button.setToolTip("Accesos y carpetas marcados como favoritos")
-        favorites_button.clicked.connect(self.open_favorites_dialog)
-        toolbar_row2.addWidget(favorites_button)
-
         toolbar_row2.addStretch()
-
-        health_button = QPushButton("🩺")
-        health_button.setObjectName("ghostButton")
-        health_button.setCursor(QCursor(Qt.PointingHandCursor))
-        health_button.setToolTip("Comprobar salud de todos los accesos")
-        health_button.clicked.connect(self.open_health_check_dialog)
-        toolbar_row2.addWidget(health_button)
-
-        sidebar_button = QPushButton("🌳")
-        sidebar_button.setObjectName("ghostButton")
-        sidebar_button.setCursor(QCursor(Qt.PointingHandCursor))
-        sidebar_button.setToolTip("Mostrar/ocultar árbol de carpetas")
-        sidebar_button.clicked.connect(self.toggle_sidebar)
-        toolbar_row2.addWidget(sidebar_button)
 
         trash_button = QPushButton("🗑")
         trash_button.setObjectName("ghostButton")
@@ -1164,6 +1204,13 @@ class MainWindow(QMainWindow):
         trash_button.clicked.connect(self.open_trash_dialog)
         toolbar_row2.addWidget(trash_button)
 
+        more_button = QPushButton("⋯  Más")
+        more_button.setObjectName("ghostButton")
+        more_button.setCursor(QCursor(Qt.PointingHandCursor))
+        more_button.setToolTip("Recientes, favoritos, salud, árbol de carpetas, exportar/importar...")
+        more_button.clicked.connect(self.show_more_menu)
+        toolbar_row2.addWidget(more_button)
+
         settings_button = QPushButton("⚙")
         settings_button.setObjectName("ghostButton")
         settings_button.setCursor(QCursor(Qt.PointingHandCursor))
@@ -1171,6 +1218,7 @@ class MainWindow(QMainWindow):
         settings_button.clicked.connect(self.open_settings_dialog)
         toolbar_row2.addWidget(settings_button)
 
+        self._more_button = more_button
         root_layout.addLayout(toolbar_row2)
         root_layout.addSpacing(10)
         self._update_sort_button_text()
@@ -1274,7 +1322,65 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self) -> None:
         c = self.colors
-        self.setStyleSheet(f"""
+        stylesheet = f"""
+            /* -- Base: aplicado a TODA la aplicación (QApplication), no
+               solo a esta ventana, para que los diálogos (Configuración,
+               Papelera, mensajes de confirmación...) hereden el mismo
+               tema oscuro en vez del tema claro por defecto de Qt, que
+               desentonaba con el resto de la app. -- */
+            QDialog {{ background: {c['bg']}; }}
+            QMessageBox {{ background: {c['bg']}; }}
+            QWidget {{ color: {c['text']}; }}
+            QLabel {{ color: {c['text']}; background: transparent; }}
+
+            QLineEdit, QComboBox {{
+                background: {c['surface']}; color: {c['text']};
+                border: 1px solid {c['surface_hover']}; border-radius: 8px;
+                padding: 6px 10px; selection-background-color: {c['accent']};
+            }}
+            QLineEdit:focus, QComboBox:focus {{ border: 1px solid {c['accent']}; }}
+            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox QAbstractItemView {{
+                background: {c['surface']}; color: {c['text']};
+                border: 1px solid {c['surface_hover']}; border-radius: 8px;
+                selection-background-color: {c['surface_hover']}; selection-color: {c['accent']};
+                padding: 4px; outline: none;
+            }}
+
+            QCheckBox, QRadioButton {{ color: {c['text']}; spacing: 8px; padding: 3px 0; background: transparent; }}
+            QCheckBox::indicator, QRadioButton::indicator {{
+                width: 15px; height: 15px; border: 1px solid {c['surface_hover']}; background: {c['surface']};
+            }}
+            QCheckBox::indicator {{ border-radius: 5px; }}
+            QRadioButton::indicator {{ border-radius: 8px; }}
+            QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+                background: {c['accent']}; border: 1px solid {c['accent']};
+            }}
+            QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border: 1px solid {c['accent']}; }}
+
+            QPushButton {{
+                background: {c['surface']}; color: {c['text']};
+                border: 1px solid {c['surface_hover']}; border-radius: 9px; padding: 7px 14px;
+            }}
+            QPushButton:hover {{ background: {c['surface_hover']}; }}
+            QPushButton:pressed {{ padding-top: 8px; padding-bottom: 6px; }}
+            QDialogButtonBox QPushButton {{ min-width: 76px; }}
+
+            QMenu {{
+                background: {c['surface']}; color: {c['text']};
+                border: 1px solid {c['surface_hover']}; border-radius: 10px; padding: 6px;
+            }}
+            QMenu::item {{ padding: 7px 24px 7px 14px; border-radius: 6px; }}
+            QMenu::item:selected {{ background: {c['surface_hover']}; color: {c['accent']}; }}
+            QMenu::separator {{ height: 1px; background: {c['surface_hover']}; margin: 6px 8px; }}
+
+            QToolTip {{
+                background: {c['surface']}; color: {c['text']};
+                border: 1px solid {c['surface_hover']}; border-radius: 6px; padding: 4px 8px;
+            }}
+
+            QScrollArea {{ background: transparent; border: none; }}
+
             QWidget#central {{ background: {c['bg']}; }}
             QScrollArea#scrollArea {{ background: transparent; border: none; }}
             QWidget#gridContainer {{ background: transparent; }}
@@ -1348,6 +1454,8 @@ class MainWindow(QMainWindow):
             QLabel#favoriteStar {{
                 color: {c['text_muted']}; font-size: 13px; background: transparent;
             }}
+            QFrame#clickableRow {{ background: transparent; border-radius: 8px; }}
+            QFrame#clickableRow:hover {{ background: {c['surface']}; }}
             QLabel#favoriteStar[active="true"] {{ color: #f5c518; }}
             QPushButton#favoriteStarButton {{
                 color: #f5c518; background: transparent; border: none;
@@ -1362,7 +1470,8 @@ class MainWindow(QMainWindow):
             QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
             QScrollBar::handle:vertical {{ background: {c['surface_hover']}; border-radius: 5px; min-height: 24px; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-        """)
+        """
+        QApplication.instance().setStyleSheet(stylesheet)
 
     # -- datos / navegación ----------------------------------------------
 
@@ -2210,6 +2319,75 @@ class MainWindow(QMainWindow):
 
     # -- estadísticas de uso --------------------------------------------------
 
+    @staticmethod
+    def _format_relative_time(timestamp: float) -> str:
+        if not timestamp:
+            return ""
+        delta = max(0, time.time() - timestamp)
+        if delta < 60:
+            return "hace un momento"
+        minutes = int(delta // 60)
+        if minutes < 60:
+            return f"hace {minutes} min" if minutes > 1 else "hace 1 min"
+        hours = int(delta // 3600)
+        if hours < 24:
+            return f"hace {hours} h" if hours > 1 else "hace 1 h"
+        days = int(delta // 86400)
+        if days == 1:
+            return "ayer"
+        if days < 7:
+            return f"hace {days} días"
+        weeks = days // 7
+        if weeks < 5:
+            return f"hace {weeks} semana" + ("" if weeks == 1 else "s")
+        return time.strftime("%d/%m/%Y", time.localtime(timestamp))
+
+    def open_recent_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Recientes")
+        dialog.resize(380, 420)
+        layout = QVBoxLayout(dialog)
+
+        recent = recent_items(self.shortcuts, limit=20)
+        if not recent:
+            layout.addWidget(QLabel(
+                "Todavía no hay historial de accesos recientes.\n"
+                "Se irá completando a medida que abras cosas."
+            ))
+        else:
+            rows_container = QWidget()
+            rows_layout = QVBoxLayout(rows_container)
+            rows_layout.setContentsMargins(0, 0, 0, 0)
+            for item in recent:
+                row = ClickableRow(item, self.colors)
+                icon = "🌐" if item["type"] == "url" else "📄"
+                row.icon_label.setText(icon)
+                pixmap = self._trash_icon_pixmap(item) if item["type"] == "shortcut" else None
+                if pixmap is not None:
+                    row.icon_label.setPixmap(pixmap)
+                row.name_label.setText(item["name"])
+                when_label = QLabel(self._format_relative_time(item.get("last_opened") or 0))
+                when_label.setStyleSheet(f"color: {self.colors['text_muted']}; font-size: 10px;")
+                row.layout().addWidget(when_label)
+
+                def open_and_close(_evt=None, target=item) -> None:
+                    dialog.close()
+                    self.open_item(target)
+
+                row.clicked.connect(open_and_close)
+                rows_layout.addWidget(row)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(rows_container)
+            layout.addWidget(scroll, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Cerrar")
+        buttons.rejected.connect(dialog.close)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.exec()
+
     def open_usage_stats_dialog(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Más usados")
@@ -2300,12 +2478,40 @@ class MainWindow(QMainWindow):
         menu.exec(QCursor.pos())
 
     def add_url_shortcut(self) -> None:
-        url, ok = QInputDialog.getText(self, "Añadir URL", "Dirección web (ej. github.com):")
-        url = url.strip()
-        if not ok or not url:
+        colors = self.colors
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Añadir URL")
+        dialog.resize(360, 140)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("Dirección web:"))
+        url_entry = QLineEdit()
+        url_entry.setPlaceholderText("ej. github.com")
+        suggestions = known_urls(self.shortcuts)
+        if suggestions:
+            completer = QCompleter(suggestions, dialog)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchContains)
+            url_entry.setCompleter(completer)
+        layout.addWidget(url_entry)
+        url_entry.setFocus()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Añadir")
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        url_entry.returnPressed.connect(dialog.accept)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        url = url_entry.text().strip()
+        if not url:
             return
         if "://" not in url:
             url = "https://" + url
+
         default_name = QUrl(url).host() or url
         name, ok = QInputDialog.getText(self, "Nombre del acceso", "Nombre:", text=default_name)
         if not ok or not name.strip():
@@ -2329,6 +2535,60 @@ class MainWindow(QMainWindow):
         })
         save_shortcuts(self.shortcuts)
         self.refresh()
+
+    def export_shortcuts_dialog(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Exportar accesos", "accesos-directos.json", "JSON (*.json)"
+        )
+        if not destination:
+            return
+        try:
+            export_shortcuts(self.shortcuts, Path(destination), categories=self.settings.get("categories", {}))
+        except OSError as exc:
+            get_logger().error("Error al exportar accesos: %s", exc)
+            QMessageBox.warning(self, "Exportar", f"No se pudo exportar:\n{exc}")
+            return
+        QMessageBox.information(self, "Exportar", f"Accesos exportados a:\n{destination}")
+
+    def import_shortcuts_dialog(self) -> None:
+        source, _ = QFileDialog.getOpenFileName(self, "Importar accesos", "", "JSON (*.json)")
+        if not source:
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "Importar accesos",
+            "¿Cómo quieres importarlos?\n\n"
+            "Sí = Añadir a los que ya tienes (se omiten los duplicados)\n"
+            "No = Reemplazar todos tus accesos actuales por los del archivo",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+        )
+        if choice == QMessageBox.Cancel:
+            return
+        mode = "merge" if choice == QMessageBox.Yes else "replace"
+
+        if mode == "replace":
+            confirm = QMessageBox.question(
+                self, "Confirmar", "Esto sustituirá TODOS tus accesos actuales. ¿Seguro?"
+            )
+            if confirm != QMessageBox.Yes:
+                return
+
+        try:
+            new_items, new_categories = import_shortcuts(
+                Path(source), mode, existing_categories=self.settings.get("categories", {})
+            )
+        except (OSError, ValueError) as exc:
+            get_logger().error("Error al importar accesos: %s", exc)
+            QMessageBox.warning(self, "Importar", f"No se pudo importar:\n{exc}")
+            return
+
+        self.shortcuts = new_items
+        self.settings["categories"] = new_categories
+        save_settings(self.settings)
+        self.selected_ids = set()
+        self.refresh()
+        QMessageBox.information(self, "Importar", f"Importación completada desde:\n{source}")
 
     def add_file_shortcut(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Selecciona un archivo", str(Path.home()))
@@ -2400,6 +2660,21 @@ class MainWindow(QMainWindow):
     def _update_sort_button_text(self) -> None:
         mode = self.settings.get("sort_mode", "manual")
         self.sort_button.setText("↕  " + self.SORT_LABELS.get(mode, "Orden"))
+
+    def show_more_menu(self) -> None:
+        menu = QMenu(self)
+        menu.addAction("🕐  Recientes", self.open_recent_dialog)
+        menu.addAction("📊  Más usados", self.open_usage_stats_dialog)
+        menu.addAction("⭐  Favoritos", self.open_favorites_dialog)
+        menu.addSeparator()
+        menu.addAction("🩺  Comprobar salud de todos los accesos", self.open_health_check_dialog)
+        sidebar_action = menu.addAction("🌳  Árbol de carpetas lateral", self.toggle_sidebar)
+        sidebar_action.setCheckable(True)
+        sidebar_action.setChecked(self.sidebar_tree.isVisible())
+        menu.addSeparator()
+        menu.addAction("⬇  Exportar accesos...", self.export_shortcuts_dialog)
+        menu.addAction("⬆  Importar accesos...", self.import_shortcuts_dialog)
+        menu.exec(self._more_button.mapToGlobal(self._more_button.rect().bottomLeft()))
 
     def show_sort_menu(self) -> None:
         menu = QMenu(self)
@@ -2591,7 +2866,7 @@ class MainWindow(QMainWindow):
     def open_settings_dialog(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Configuración")
-        dialog.resize(340, 380)
+        dialog.resize(360, 500)
         layout = QVBoxLayout(dialog)
 
         layout.addWidget(QLabel("Tema"))
@@ -2645,10 +2920,21 @@ class MainWindow(QMainWindow):
             path_always_radio.setChecked(True)
 
         startup_check = None
+        minimized_check = None
         if startup_supported():
             startup_check = QCheckBox("Iniciar con Windows")
             startup_check.setChecked(is_startup_enabled())
             layout.addWidget(startup_check)
+
+            minimized_check = QCheckBox("Iniciar minimizado en la bandeja")
+            minimized_check.setChecked(bool(self.settings.get("start_minimized", False)))
+            minimized_check.setEnabled(startup_check.isChecked())
+            startup_check.toggled.connect(minimized_check.setEnabled)
+            layout.addWidget(minimized_check)
+
+        notify_broken_check = QCheckBox("Avisar (en la bandeja) si hay accesos rotos al arrancar")
+        notify_broken_check.setChecked(bool(self.settings.get("notify_broken_links", True)))
+        layout.addWidget(notify_broken_check)
 
         cache_row = QHBoxLayout()
         cache_size = win_icons.disk_cache_size_bytes()
@@ -2672,8 +2958,29 @@ class MainWindow(QMainWindow):
         cache_row.addWidget(clear_cache_button)
         layout.addLayout(cache_row)
 
+        log_row = QHBoxLayout()
+        log_label = QLabel("Registro de la aplicación")
+        log_row.addWidget(log_label)
+        log_row.addStretch()
+        view_log_button = QPushButton("Ver registro...")
+
+        def view_log() -> None:
+            if not LOG_FILE.exists():
+                QMessageBox.information(dialog, "Registro", "Todavía no se ha escrito nada en el registro.")
+                return
+            try:
+                open_path(str(LOG_FILE))
+            except OSError as exc:
+                QMessageBox.warning(dialog, "Registro", f"No se pudo abrir el registro:\n{exc}")
+
+        view_log_button.clicked.connect(view_log)
+        log_row.addWidget(view_log_button)
+        layout.addLayout(log_row)
+
         layout.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Guardar")
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
         layout.addWidget(buttons)
 
         def save_and_close() -> None:
@@ -2690,7 +2997,11 @@ class MainWindow(QMainWindow):
             else:
                 self.settings["path_display"] = "always"
             if startup_check is not None:
-                set_startup_enabled(startup_check.isChecked())
+                self.settings["start_minimized"] = (
+                    minimized_check.isChecked() if minimized_check is not None else False
+                )
+                set_startup_enabled(startup_check.isChecked(), minimized=self.settings["start_minimized"])
+            self.settings["notify_broken_links"] = notify_broken_check.isChecked()
             save_settings(self.settings)
             if theme_changed:
                 self.colors = get_theme(theme_key)
@@ -2726,7 +3037,7 @@ class MainWindow(QMainWindow):
         image = win_icons.get_icon_image(expand_path(path), 20)
         return pil_to_pixmap(image) if image is not None else None
 
-    def open_health_check_dialog(self) -> None:
+    def _find_broken_shortcuts(self) -> list[dict]:
         broken: list[dict] = []
         for it in self.shortcuts:
             if it["type"] != "shortcut":
@@ -2734,6 +3045,10 @@ class MainWindow(QMainWindow):
             path = it.get("path", "")
             if not path or not Path(expand_path(path)).expanduser().exists():
                 broken.append(it)
+        return broken
+
+    def open_health_check_dialog(self) -> None:
+        broken = self._find_broken_shortcuts()
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Comprobación de salud")
@@ -2995,7 +3310,26 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Error al actualizar", message)
 
 
+def _install_exception_logging() -> None:
+    """Registra en log.txt cualquier excepción no capturada, en vez de que
+    se pierda sin más (sobre todo importante en el .exe "windowed", que no
+    tiene consola donde poder verla)."""
+    logger = get_logger()
+    previous_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        logger.error("Excepción no capturada", exc_info=(exc_type, exc_value, exc_tb))
+        previous_hook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
+
+
 def main() -> None:
+    setup_logging()
+    _install_exception_logging()
+    logger = get_logger()
+    logger.info("Arrancando Accesos Directos v%s", get_app_version())
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)
@@ -3007,10 +3341,14 @@ def main() -> None:
         # hemos pedido que se muestre y esta copia nueva termina aquí,
         # sin llegar a crear ventana ni icono de bandeja propios — así
         # se evita la duplicación en la flechita de Windows.
+        logger.info("Ya había una instancia abierta; se activa y esta copia termina.")
         return
 
     window = MainWindow()
-    window.show()
+    if START_MINIMIZED_FLAG not in sys.argv:
+        window.show()
+    else:
+        logger.info("Arranque minimizado (--start-minimized): no se muestra la ventana.")
     sys.exit(app.exec())
 
 
