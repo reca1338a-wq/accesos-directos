@@ -3,5 +3,8 @@ __pycache__/
 .venv/
 venv/
 settings.json
+shortcuts.json
+update_config.json
+log.txt
 build/
 dist/

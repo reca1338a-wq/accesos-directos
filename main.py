@@ -19,23 +19,38 @@ import json
 import os
 import sys
 import time
+from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PySide6.QtCore import (
     QByteArray,
     QEasingCurve,
     QMimeData,
+    QObject,
     QPoint,
     QPropertyAnimation,
     QRect,
+    QRunnable,
     QSize,
     Qt,
     QThread,
+    QThreadPool,
     QTimer,
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QDrag, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QDrag,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -59,6 +74,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QRubberBand,
@@ -73,6 +89,10 @@ from PySide6.QtWidgets import (
 
 import win_icons
 from app_config import (
+    disk_folder_target,
+    FOLDER_IMPORT_CONFIRM_THRESHOLD,
+    FOLDER_IMPORT_MAX_ITEMS,
+    build_folder_tree_items,
     DEFAULT_PATH_DISPLAY,
     DEFAULT_SIZE,
     GRID_SNAP_STEP,
@@ -171,15 +191,133 @@ def open_url(url: str) -> None:
         raise OSError(f"No se pudo abrir la URL: {url}")
 
 
+_PIXMAP_CACHE: OrderedDict[tuple, QPixmap] = OrderedDict()
+_PIXMAP_CACHE_MAX = 320
+
+
+def _pil_to_pixmap_fast(image) -> QPixmap:
+    """Convierte PIL → QPixmap copiando el buffer RGBA (mucho más rápido que PNG)."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    width, height = image.size
+    stride = width * 4
+    qimg = QImage(image.tobytes("raw", "RGBA"), width, height, stride, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimg.copy())
+
+
 def pil_to_pixmap(image) -> QPixmap:
-    """Convierte una imagen PIL (RGBA) en un QPixmap, pasando por PNG en
-    memoria: es el camino más fiable entre Pillow y Qt, sin depender de
-    que PIL.ImageQt detecte bien el binding de Qt instalado."""
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    pixmap = QPixmap()
-    pixmap.loadFromData(buffer.getvalue(), "PNG")
+    """Convierte una imagen PIL (RGBA) en un QPixmap."""
+    try:
+        return _pil_to_pixmap_fast(image)
+    except Exception:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        pixmap = QPixmap()
+        pixmap.loadFromData(buffer.getvalue(), "PNG")
+        return pixmap
+
+
+def pixmap_from_pil(image, cache_key: tuple | None = None) -> QPixmap:
+    if cache_key is not None and cache_key in _PIXMAP_CACHE:
+        _PIXMAP_CACHE.move_to_end(cache_key)
+        return _PIXMAP_CACHE[cache_key]
+    pixmap = pil_to_pixmap(image)
+    if cache_key is not None:
+        _PIXMAP_CACHE[cache_key] = pixmap
+        while len(_PIXMAP_CACHE) > _PIXMAP_CACHE_MAX:
+            _PIXMAP_CACHE.popitem(last=False)
     return pixmap
+
+
+class _IconLoadEmitter(QObject):
+    loaded = Signal(str, object)  # item_id, imagen PIL o None
+
+
+class _IconLoadTask(QRunnable):
+    def __init__(self, item_id: str, loader, emitter: _IconLoadEmitter) -> None:
+        super().__init__()
+        self.item_id = item_id
+        self.loader = loader
+        self.emitter = emitter
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            image = self.loader()
+        except Exception:
+            image = None
+        self.emitter.loaded.emit(self.item_id, image)
+
+
+# Tope de elementos totales al explorar muchas carpetas a la vez (seguridad).
+EXPLORE_TOTAL_LIMIT = 100000
+
+# Cuántas tarjetas se dibujan de golpe (el resto, con «Mostrar más»). Crear
+# miles de widgets de Qt es lo que más tarda de toda la app.
+RENDER_PAGE = 300
+
+# Extensiones que casi seguro son ARCHIVOS: al buscar carpetas sin explorar
+# no se gasta tiempo (ni accesos a disco de red) comprobando estos accesos.
+KNOWN_FILE_EXTS = frozenset(
+    ".pdf .doc .docx .xls .xlsx .xlsm .csv .txt .rtf .odt .ods .ppt .pptx .png .jpg .jpeg .gif .bmp "
+    ".webp .tif .tiff .ico .svg .mp3 .wav .mp4 .mkv .avi .mov .exe .msi .bat .cmd .ps1 .py .js .ts .json "
+    ".xml .html .htm .css .sql .log .md .ini .cfg .zip .rar .7z .gz .tar .iso .dll .url .dwg .dxf .psd "
+    ".ai .eml .msg .pst .bak .tmp .dat .db .mdb .accdb .vsdx .pub .odp .key .numbers .pages".split()
+)
+
+_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+_EXISTS_TTL = 20.0
+
+
+def path_exists_cached(path: str) -> bool:
+    """`exists()` con caché de unos segundos: cada refresco de la cuadrícula
+    comprobaba todas las rutas en el disco (y en discos de red eso se nota)."""
+    now = time.monotonic()
+    hit = _EXISTS_CACHE.get(path)
+    if hit is not None and now - hit[0] < _EXISTS_TTL:
+        return hit[1]
+    try:
+        exists = Path(expand_path(path)).expanduser().exists()
+    except (OSError, ValueError):
+        exists = False
+    if len(_EXISTS_CACHE) > 20000:
+        _EXISTS_CACHE.clear()
+    _EXISTS_CACHE[path] = (now, exists)
+    return exists
+
+
+class IconLoadCoordinator(QObject):
+    """Carga iconos en segundo plano; el QPixmap se crea solo en el hilo de la UI."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._emitter = _IconLoadEmitter()
+        self._pool = QThreadPool.globalInstance()
+        self._pool.setMaxThreadCount(min(4, max(2, (os.cpu_count() or 4) // 2)))
+
+    def connect_loaded(self, slot) -> None:
+        self._emitter.loaded.connect(slot)
+
+    def request(self, item_id: str, loader) -> None:
+        self._pool.start(_IconLoadTask(item_id, loader, self._emitter))
+
+
+_ICON_LOADER = IconLoadCoordinator()
+
+
+def _tile_icon_cache_key(item: dict, icon_px: int, sibling_items: list[dict]) -> tuple | None:
+    if item["type"] == "folder":
+        return ("folder", icon_px)  # mismo icono para todas: se comparte en caché
+    if item["type"] != "shortcut":
+        return None
+    path = expand_path(item.get("path", ""))
+    if not path:
+        return None
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        mtime = 0
+    return ("path", path, icon_px, mtime)
 
 
 def color_swatch_icon(hex_color: str, size: int = 12) -> QIcon:
@@ -340,9 +478,11 @@ class TileWidget(QFrame):
     def __init__(
         self, item: dict, colors: dict, sibling_items: list[dict],
         categories: dict | None = None, compact: bool = False, subtitle_override: str | None = None,
-        path_display_mode: str = DEFAULT_PATH_DISPLAY,
+        path_display_mode: str = DEFAULT_PATH_DISPLAY, use_shadow: bool = True,
+        child_counts: dict | None = None,
     ) -> None:
         super().__init__()
+        self._child_counts = child_counts
         self.item = item
         self.colors = colors
         self.compact = compact
@@ -384,7 +524,7 @@ class TileWidget(QFrame):
         is_broken = bool(
             item["type"] == "shortcut"
             and item.get("path")
-            and not Path(expand_path(item["path"])).expanduser().exists()
+            and not path_exists_cached(item["path"])
         )
         self._is_broken = is_broken
         self._is_url = item["type"] == "url"
@@ -403,21 +543,28 @@ class TileWidget(QFrame):
         content = QWidget()
         outer.addWidget(content, stretch=1)
         icon_px = 22 if compact else (40 if preset["width"] >= 200 else (32 if preset["width"] >= 150 else 26))
-        pixmap = self._load_icon(sibling_items, icon_px)
+        self._sibling_items = sibling_items
+        self._icon_px = icon_px
+        self._icon_label: QLabel | None = None
 
-        # La sombra se crea siempre (antes solo se creaba en modo tarjeta,
-        # y como enterEvent/leaveEvent la usan sin comprobar, pasar el
-        # ratón por una fila en modo compacto petaba con AttributeError).
-        self._shadow = QGraphicsDropShadowEffect(self)
-        self._shadow.setBlurRadius(10 if compact else 18)
-        self._shadow.setOffset(0, 2 if compact else 3)
-        self._shadow.setColor(QColor(0, 0, 0, 70 if compact else 90))
-        self.setGraphicsEffect(self._shadow)
-        self._shadow_anim = QPropertyAnimation(self._shadow, b"blurRadius")
-        self._shadow_anim.setDuration(150)
-        self._shadow_anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._hover_blur = 16 if compact else 28
-        self._base_blur = 10 if compact else 18
+        self._shadow = None
+        self._shadow_anim = None
+        if use_shadow:
+            # QGraphicsDropShadowEffect es costoso con muchas tarjetas; solo
+            # se activa en cuadrículas pequeñas (ver refresh()).
+            self._shadow = QGraphicsDropShadowEffect(self)
+            self._shadow.setBlurRadius(10 if compact else 16)
+            self._shadow.setOffset(0, 2 if compact else 3)
+            self._shadow.setColor(QColor(0, 0, 0, 55 if compact else 72))
+            self.setGraphicsEffect(self._shadow)
+            self._shadow_anim = QPropertyAnimation(self._shadow, b"blurRadius")
+            self._shadow_anim.setDuration(120)
+            self._shadow_anim.setEasingCurve(QEasingCurve.OutCubic)
+        else:
+            self.setProperty("lightTile", "true")
+
+        self._hover_blur = 14 if compact else 22
+        self._base_blur = 10 if compact else 16
 
         if compact:
             layout = QHBoxLayout(content)
@@ -427,14 +574,9 @@ class TileWidget(QFrame):
             icon_label = QLabel()
             icon_label.setFixedSize(icon_px + 4, icon_px + 4)
             icon_label.setAlignment(Qt.AlignCenter)
-            if pixmap is not None:
-                icon_label.setPixmap(pixmap)
-            else:
-                icon_label.setText(
-                    "⚠️" if is_broken else ("🌐" if self._is_url else ("📁" if item["type"] == "folder" else "📄"))
-                )
-                icon_label.setFont(QFont("Segoe UI Emoji", 12))
+            self._fill_icon_placeholder(icon_label, compact=True)
             layout.addWidget(icon_label)
+            self._icon_label = icon_label
 
             name_label = QLabel(item["name"])
             name_label.setObjectName("tileName")
@@ -452,14 +594,9 @@ class TileWidget(QFrame):
         icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignCenter)
         icon_label.setFixedHeight(36)
-        if pixmap is not None:
-            icon_label.setPixmap(pixmap)
-        else:
-            icon_label.setText(
-                "⚠️" if is_broken else ("🌐" if self._is_url else ("📁" if item["type"] == "folder" else "📄"))
-            )
-            icon_label.setFont(QFont("Segoe UI Emoji", 20))
+        self._fill_icon_placeholder(icon_label, compact=False)
         layout.addWidget(icon_label)
+        self._icon_label = icon_label
 
         name_label = QLabel(item["name"])
         name_label.setObjectName("tileName")
@@ -564,19 +701,39 @@ class TileWidget(QFrame):
         )
         return zone.contains(pos)
 
-    def _load_icon(self, sibling_items: list[dict], icon_px: int):
+    def _fill_icon_placeholder(self, icon_label: QLabel, *, compact: bool) -> None:
+        icon_label.setPixmap(QPixmap())
+        icon_label.setText(
+            "⚠️" if self._is_broken else ("🌐" if self._is_url else ("📁" if self.item["type"] == "folder" else "📄"))
+        )
+        icon_label.setFont(QFont("Segoe UI Emoji", 12 if compact else 20))
+
+    def load_icon_image(self) -> object | None:
         if self.item["type"] == "folder":
-            children = [it for it in sibling_items if it["parent_id"] == self.item["id"]]
-            preview_paths = [c.get("path") for c in children if c["type"] == "shortcut"][:3]
-            if not preview_paths:
-                return None
-            image = win_icons.compose_folder_icon(preview_paths, size=icon_px)
-            return pil_to_pixmap(image) if image is not None else None
+            # Las carpetas internas muestran siempre el icono de carpeta
+            # normal (ya no un mosaico con los archivos de dentro).
+            return win_icons.get_generic_folder_icon(self._icon_px)
 
         if self._is_broken or self._is_url:
             return None
-        image = win_icons.get_icon_image(expand_path(self.item.get("path", "")), icon_px)
-        return pil_to_pixmap(image) if image is not None else None
+        return win_icons.get_icon_image(expand_path(self.item.get("path", "")), self._icon_px)
+
+    def apply_icon_image(self, image) -> None:
+        if image is None or self._icon_label is None:
+            return
+        cache_key = _tile_icon_cache_key(self.item, self._icon_px, self._sibling_items)
+        pixmap = pixmap_from_pil(image, cache_key)
+        if pixmap.isNull():
+            return
+        self._icon_label.setPixmap(
+            pixmap.scaled(
+                self._icon_px,
+                self._icon_px,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        self._icon_label.setText("")
 
     def _path_text(self) -> str:
         """Ruta original ya acortada (con `~` para la carpeta personal),
@@ -591,7 +748,10 @@ class TileWidget(QFrame):
         if self.subtitle_override is not None:
             return self.subtitle_override
         if self.item["type"] == "folder":
-            count = sum(1 for it in sibling_items if it["parent_id"] == self.item["id"])
+            if self._child_counts is not None:
+                count = self._child_counts.get(self.item["id"], 0)
+            else:
+                count = sum(1 for it in sibling_items if it["parent_id"] == self.item["id"])
             return f"{count} elemento" + ("" if count == 1 else "s")
         if self._is_broken:
             return "⚠ No se encuentra"
@@ -632,19 +792,21 @@ class TileWidget(QFrame):
     def enterEvent(self, event) -> None:
         self._hovering = True
         self._update_favorite_visual()
-        self._shadow_anim.stop()
-        self._shadow_anim.setStartValue(self._shadow.blurRadius())
-        self._shadow_anim.setEndValue(self._hover_blur)
-        self._shadow_anim.start()
+        if self._shadow_anim is not None and self._shadow is not None:
+            self._shadow_anim.stop()
+            self._shadow_anim.setStartValue(self._shadow.blurRadius())
+            self._shadow_anim.setEndValue(self._hover_blur)
+            self._shadow_anim.start()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._hovering = False
         self._update_favorite_visual()
-        self._shadow_anim.stop()
-        self._shadow_anim.setStartValue(self._shadow.blurRadius())
-        self._shadow_anim.setEndValue(self._base_blur)
-        self._shadow_anim.start()
+        if self._shadow_anim is not None and self._shadow is not None:
+            self._shadow_anim.stop()
+            self._shadow_anim.setStartValue(self._shadow.blurRadius())
+            self._shadow_anim.setEndValue(self._base_blur)
+            self._shadow_anim.start()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
@@ -677,8 +839,12 @@ class TileWidget(QFrame):
             moved = (event.position().toPoint() - self._press_pos).manhattanLength()
             if moved >= QApplication.startDragDistance():
                 self._dragging = True
-                self.drag_started.emit(self.item)
                 self._press_pos = None
+                # La señal SIEMPRE lo último: begin_drag() abre un QDrag
+                # (bucle de eventos anidado) y la ventana puede reconstruir
+                # la cuadrícula, destruyendo esta tarjeta. Tras el emit no
+                # se puede tocar `self`.
+                self.drag_started.emit(self.item)
                 return
         super().mouseMoveEvent(event)
 
@@ -693,13 +859,26 @@ class TileWidget(QFrame):
         self._dragging = False
         inside = self.rect().contains(event.position().toPoint())
         self._press_pos = None
+        # Primero el super() y DESPUÉS la señal: en modo "un clic" la
+        # ventana abre la carpeta y reconstruye la cuadrícula, con lo que
+        # esta tarjeta puede quedar destruida al volver del emit. Llamar
+        # a super() después daba "Internal C++ object (TileWidget) already
+        # deleted".
+        super().mouseReleaseEvent(event)
         if event.button() == Qt.LeftButton and inside and not was_dragging:
             self.clicked_with_modifiers.emit(self.item, event.modifiers())
-        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            # Causa del crasheo del log ("TileWidget already deleted"):
+            # antes se llamaba a super().mouseDoubleClickEvent() DESPUÉS de
+            # emitir, pero al abrir el elemento la ventana ya había
+            # reconstruido la cuadrícula y esta tarjeta estaba destruida.
+            # Ahora la señal es lo último que hace este método y no se
+            # toca `self` después.
+            event.accept()
             self.double_clicked.emit(self.item)
+            return
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:
@@ -797,9 +976,13 @@ class GridContainer(QWidget):
             self._window.end_marquee()
         super().mouseReleaseEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        self._window.show_background_menu(event.globalPos())
+        event.accept()
+
     def resizeEvent(self, event) -> None:
-        self._window._relayout_sections()
         super().resizeEvent(event)
+        self._window._schedule_relayout_sections()
 
     def dragEnterEvent(self, event) -> None:
         md = event.mimeData()
@@ -834,6 +1017,75 @@ class GridContainer(QWidget):
 # ---------------------------------------------------------------------------
 
 
+class ExploreWorker(QThread):
+    """Lee del disco, en segundo plano y en paralelo (4 a la vez), el árbol
+    de cada carpeta sin explorar. No toca la interfaz ni los datos: solo
+    avisa con señales y la ventana principal es quien los incorpora."""
+
+    progress = Signal(int, int, str)          # hechas, total, nombre
+    folder_done = Signal(str, object, object)  # id, entradas, estadísticas
+    folder_failed = Signal(str, str)           # id, nombre
+
+    def __init__(self, jobs: list[tuple[str, str, str, str | None, int]]) -> None:
+        super().__init__()
+        self._jobs = jobs  # (id, nombre, carpeta_del_disco, parent_id, order)
+
+    @staticmethod
+    def _scan(job):
+        _item_id, _name, target, parent_id, order = job
+        os.listdir(target)  # falla pronto si no se puede leer
+        return build_folder_tree_items(target, parent_id, order)
+
+    def run(self) -> None:
+        total = len(self._jobs)
+        done = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(self._scan, job): job for job in self._jobs}
+            for future in as_completed(futures):
+                if self.isInterruptionRequested():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                job = futures[future]
+                try:
+                    entries, stats = future.result()
+                except Exception:  # noqa: BLE001 — una carpeta ilegible no para el resto
+                    entries, stats = None, None
+                if entries:
+                    self.folder_done.emit(job[0], entries, stats)
+                else:
+                    self.folder_failed.emit(job[0], job[1])
+                done += 1
+                self.progress.emit(done, total, job[1])
+
+
+class UnexploredScanWorker(QThread):
+    """Comprueba en segundo plano qué accesos apuntan a carpetas del disco
+    (en discos de red cada comprobación puede tardar; así no congela nada)."""
+
+    scanned = Signal(object)  # {ruta: carpeta_real | None}
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__()
+        self._paths = paths
+
+    @staticmethod
+    def _check(path: str):
+        try:
+            return path, disk_folder_target(path, allow_slow=False)
+        except Exception:  # noqa: BLE001
+            return path, None
+
+    def run(self) -> None:
+        result: dict[str, str | None] = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for path, target in pool.map(self._check, self._paths):
+                if self.isInterruptionRequested():
+                    break
+                result[path] = target
+        self.scanned.emit(result)
+
+
 class UpdateCheckWorker(QThread):
     result_ready = Signal(object)  # UpdateInfo | None
     failed = Signal(str)
@@ -862,7 +1114,9 @@ class UpdateInstallWorker(QThread):
         try:
             apply_update(
                 self.update.download_url,
+                token=self.update.token,
                 latest_version=self.update.latest_version,
+                sha256=self.update.sha256,
                 progress_callback=lambda done, total: self.progress.emit(done, total),
             )
         except UpdateError as exc:
@@ -976,6 +1230,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(12)
+        self._relayout_timer.timeout.connect(self._relayout_sections)
+
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(200)
+        self._search_debounce.timeout.connect(self._apply_search_query)
+        self._pending_search_text = ""
+
+        _ICON_LOADER.connect_loaded(self._on_tile_icon_loaded)
+        QApplication.instance().aboutToQuit.connect(self._stop_background_workers)
+
         self._build_ui()
         self._apply_theme()
         self.refresh()
@@ -988,12 +1256,19 @@ class MainWindow(QMainWindow):
         self._update_install_thread: UpdateInstallWorker | None = None
         self._update_progress_dialog: UpdateProgressDialog | None = None
         self._pending_update: UpdateInfo | None = None
+        self._manual_check = False
+        self._last_update_check = 0.0
+        self._update_failures = 0
+        self._dismissed_update_version = ""
+        self._notified_update_version = ""
         self.update_icon.mousePressEvent = lambda _e: self.check_updates_dialog(manual=True)
-        if self.settings.get("auto_check_updates", True):
-            QTimer.singleShot(2500, lambda: self.check_updates_dialog(manual=False))
+        QTimer.singleShot(2500, self._auto_check_updates)
         self._update_timer = QTimer(self)
-        self._update_timer.timeout.connect(lambda: self.check_updates_dialog(manual=False))
-        self._update_timer.start(15 * 60 * 1000)
+        self._update_timer.timeout.connect(self._auto_check_updates)
+        self._update_timer.start(10 * 60 * 1000)
+        # Al volver a la ventana (p. ej. desde la bandeja) se comprueba si
+        # hace un rato que no se hacía.
+        QApplication.instance().applicationStateChanged.connect(self._on_app_state_changed)
 
         if self.settings.get("notify_broken_links", True):
             QTimer.singleShot(4000, self._notify_broken_links_if_any)
@@ -1129,6 +1404,27 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.update_icon)
         root_layout.addLayout(header_row)
 
+        # Aviso (sin ventanas emergentes) de que hay una versión nueva.
+        self.update_banner = QFrame()
+        self.update_banner.setObjectName("searchBanner")
+        update_banner_layout = QHBoxLayout(self.update_banner)
+        update_banner_layout.setContentsMargins(12, 8, 12, 8)
+        self.update_banner_label = QLabel()
+        self.update_banner_label.setWordWrap(True)
+        update_banner_layout.addWidget(self.update_banner_label, stretch=1)
+        update_now_button = QPushButton("Actualizar ahora")
+        update_now_button.setObjectName("accentButton")
+        update_now_button.setCursor(QCursor(Qt.PointingHandCursor))
+        update_now_button.clicked.connect(self._install_pending_update)
+        update_banner_layout.addWidget(update_now_button)
+        update_later_button = QPushButton("Más tarde")
+        update_later_button.setObjectName("ghostButton")
+        update_later_button.setCursor(QCursor(Qt.PointingHandCursor))
+        update_later_button.clicked.connect(self._dismiss_update_banner)
+        update_banner_layout.addWidget(update_later_button)
+        self.update_banner.hide()
+        root_layout.addWidget(self.update_banner)
+
         self.breadcrumb_row = QWidget()
         self._breadcrumb_layout = QHBoxLayout(self.breadcrumb_row)
         self._breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
@@ -1139,6 +1435,42 @@ class MainWindow(QMainWindow):
         self.search_status_label.setObjectName("breadcrumb")
         self.search_status_label.hide()
         root_layout.addWidget(self.search_status_label)
+
+        # Aviso de la búsqueda: hay accesos a carpetas que aún no se han
+        # explorado, así que sus archivos no pueden aparecer en los resultados.
+        self._explore_dismissed = False
+        self._unexplored_cache: dict[str, tuple[float, str | None]] = {}
+        self.search_banner = QFrame()
+        self.search_banner.setObjectName("searchBanner")
+        banner_layout = QHBoxLayout(self.search_banner)
+        banner_layout.setContentsMargins(12, 8, 12, 8)
+        self.search_banner_label = QLabel()
+        self.search_banner_label.setWordWrap(True)
+        banner_layout.addWidget(self.search_banner_label, stretch=1)
+        explore_button = QPushButton("Explorar ahora")
+        explore_button.setObjectName("accentButton")
+        explore_button.setCursor(QCursor(Qt.PointingHandCursor))
+        explore_button.clicked.connect(self.explore_unexplored_folders)
+        banner_layout.addWidget(explore_button)
+        dismiss_button = QPushButton("Ahora no")
+        dismiss_button.setObjectName("ghostButton")
+        dismiss_button.setCursor(QCursor(Qt.PointingHandCursor))
+        dismiss_button.clicked.connect(self._dismiss_search_banner)
+        banner_layout.addWidget(dismiss_button)
+        cancel_explore_button = QPushButton("Cancelar")
+        cancel_explore_button.setObjectName("ghostButton")
+        cancel_explore_button.setCursor(QCursor(Qt.PointingHandCursor))
+        cancel_explore_button.clicked.connect(self._cancel_exploration)
+        cancel_explore_button.hide()
+        banner_layout.addWidget(cancel_explore_button)
+        self._banner_explore_button = explore_button
+        self._banner_dismiss_button = dismiss_button
+        self._banner_cancel_button = cancel_explore_button
+        self._explore_worker: ExploreWorker | None = None
+        self._scan_worker: UnexploredScanWorker | None = None
+        self._explore_state: dict = {}
+        self.search_banner.hide()
+        root_layout.addWidget(self.search_banner)
 
         divider = QFrame()
         divider.setObjectName("divider")
@@ -1151,12 +1483,14 @@ class MainWindow(QMainWindow):
         add_button = QPushButton("+  Añadir")
         add_button.setObjectName("accentButton")
         add_button.setCursor(QCursor(Qt.PointingHandCursor))
+        add_button.setToolTip("Añadir carpeta, archivo, programa o página web")
         add_button.clicked.connect(self.add_shortcut_dialog)
         toolbar_row.addWidget(add_button)
 
         back_button = QPushButton("←  Atrás")
         back_button.setObjectName("ghostButton")
         back_button.setCursor(QCursor(Qt.PointingHandCursor))
+        back_button.setToolTip("Volver a la carpeta anterior")
         back_button.clicked.connect(self.go_back)
         toolbar_row.addWidget(back_button)
         self.back_button = back_button
@@ -1229,6 +1563,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setObjectName("scrollArea")
         self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.verticalScrollBar().setSingleStep(24)
 
         self.grid_container = GridContainer(self)
         self.grid_container.setObjectName("gridContainer")
@@ -1272,7 +1607,7 @@ class MainWindow(QMainWindow):
         self._drop_indicator.hide()
         self._drop_highlight_id: str | None = None
 
-        self.empty_label = QLabel("Esta carpeta está vacía.\nUsa «+ Añadir» para empezar.")
+        self.empty_label = QLabel("Esta carpeta está vacía.\n\nUsa «+ Añadir», haz clic derecho aquí\no arrastra archivos y carpetas desde el Explorador.")
         self.empty_label.setObjectName("emptyLabel")
         self.empty_label.setAlignment(Qt.AlignCenter)
 
@@ -1414,6 +1749,8 @@ class MainWindow(QMainWindow):
                 background: transparent; padding: 0px;
             }}
             QFrame#divider {{ background: {c['surface']}; border: none; }}
+            QFrame#searchBanner {{ background: {c['surface']}; border: 1px solid {c['accent']}; border-radius: 10px; }}
+            QFrame#searchBanner QLabel {{ color: {c['text']}; font-size: 12px; }}
             QLabel#emptyLabel {{ color: {c['text_muted']}; font-size: 13px; }}
             QLabel#footer {{ color: {c['text_muted']}; font-size: 10px; margin-top: 6px; }}
 
@@ -1437,10 +1774,21 @@ class MainWindow(QMainWindow):
             QLineEdit#searchBox:focus {{ border: 1px solid {c['accent']}; }}
 
             QFrame#tile {{
-                background: {c['surface']}; border-radius: 16px; border: 1px solid {c['surface']};
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {c['surface_hover']}, stop:1 {c['surface']});
+                border-radius: 16px; border: 1px solid {c['surface_hover']};
             }}
-            QFrame#tile:hover {{ background: {c['surface_hover']}; border: 1px solid {c['accent']}; }}
-            QFrame#tile[selected="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
+            QFrame#tile[lightTile="true"] {{
+                background: {c['surface']}; border: 1px solid {c['surface_hover']};
+            }}
+            QFrame#tile:hover {{
+                background: {c['surface_hover']}; border: 1px solid {c['accent']};
+            }}
+            QFrame#tile[selected="true"] {{
+                border: 2px solid {c['accent']};
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {c['surface_hover']}, stop:1 {c['surface']});
+            }}
             QFrame#tile[dropTarget="true"] {{ border: 2px solid {c['accent']}; background: {c['surface_hover']}; }}
             QFrame#dropIndicator {{ background: {c['accent']}; border-radius: 2px; }}
             QLabel#resizeGrip {{
@@ -1515,6 +1863,12 @@ class MainWindow(QMainWindow):
         # un botón (menos el último, la carpeta actual) que salta
         # directamente a ese nivel, sin tener que pulsar "Atrás" varias
         # veces uno a uno.
+        # Los nombres se recalculan SIEMPRE a partir de los datos actuales
+        # (por id de carpeta). Antes `self.breadcrumb` guardaba copias del
+        # nombre tal como era al entrar en cada carpeta, así que al
+        # renombrar una carpeta las migas seguían mostrando el nombre viejo.
+        self.breadcrumb = self._breadcrumb_chain_for(self.current_folder_id)
+
         while self._breadcrumb_layout.count():
             layout_item = self._breadcrumb_layout.takeAt(0)
             widget = layout_item.widget()
@@ -1556,6 +1910,9 @@ class MainWindow(QMainWindow):
         self.sidebar_tree.setVisible(visible)
         self.settings["sidebar_visible"] = visible
         save_settings(self.settings)
+        if visible and getattr(self, "_sidebar_dirty", True):
+            self._populate_sidebar()
+            self._sidebar_dirty = False
 
     def _populate_sidebar(self) -> None:
         self.sidebar_tree.blockSignals(True)
@@ -1612,65 +1969,135 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def refresh(self) -> None:
-        while self._sections_layout.count():
-            layout_item = self._sections_layout.takeAt(0)
-            if layout_item.widget() is not None:
-                layout_item.widget().hide()
-                layout_item.widget().deleteLater()
+        if self.current_folder_id is not None and not any(
+            it["id"] == self.current_folder_id and it["type"] == "folder" for it in self.shortcuts
+        ):
+            self.current_folder_id = None
+            self.breadcrumb = [("Inicio", None)]
+        self._update_search_banner()
+        render_key = (self.current_folder_id, self.search_query, self.category_filter)
+        if render_key != getattr(self, "_render_key", None):
+            self._render_key = render_key
+            self._render_limit = RENDER_PAGE
+        self._child_counts = Counter(it["parent_id"] for it in self.shortcuts)
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            while self._sections_layout.count():
+                layout_item = self._sections_layout.takeAt(0)
+                old_widget = layout_item.widget()
+                if old_widget is not None:
+                    old_widget.hide()
+                    if old_widget is self.empty_label:
+                        # Se reutiliza: si se borrara, la siguiente vez que
+                        # una búsqueda/carpeta quedara vacía fallaría al volver a usarlo.
+                        old_widget.setParent(None)
+                    else:
+                        old_widget.deleteLater()
 
-        self._drop_indicator.hide()
-        self._drop_highlight_id = None
-        self._tiles = []
-        self._tile_by_id = {}
-        self._flow_sections = []
-        compact = self.settings.get("card_style") == "compact"
-        self._populate_sidebar()
-
-        if self.search_query:
-            self.breadcrumb_row.hide()
-            self.search_status_label.show()
-            self.back_button.setEnabled(False)
-            results = self._search_results()
-            self.search_status_label.setText(
-                f"🔍 {len(results)} resultado(s) para «{self.search_query}»"
-            )
-            if not results:
-                self._sections_layout.addWidget(self.empty_label)
+            self._drop_indicator.hide()
+            self._drop_highlight_id = None
+            self._tiles = []
+            self._tile_by_id = {}
+            self._flow_sections = []
+            compact = self.settings.get("card_style") == "compact"
+            if self.settings.get("sidebar_visible", False):
+                self._populate_sidebar()
+                self._sidebar_dirty = False
             else:
-                path_map = {it["id"]: self._path_to_item(it) for it in results}
-                self._add_section(None, results, compact, path_map=path_map)
+                self._sidebar_dirty = True  # se rellenará al mostrarla
+
+            items_to_show: list[dict] = []
+            section_specs: list[tuple[str | None, list[dict], dict[str, str] | None]] = []
+
+            if self.search_query:
+                self.breadcrumb_row.hide()
+                self.search_status_label.show()
+                self.back_button.setEnabled(False)
+                results = self._search_results()
+                shown_note = (
+                    f" (mostrando {self._render_limit})" if len(results) > self._render_limit else ""
+                )
+                self.search_status_label.setText(
+                    f"🔍 {len(results)} resultado(s) para «{self.search_query}»{shown_note}"
+                )
+                if not results:
+                    self._sections_layout.addWidget(self.empty_label)
+                else:
+                    path_map = self._build_path_map(results[: self._render_limit])
+                    section_specs.append((None, results, path_map))
+                    items_to_show = results
+            else:
+                self.search_status_label.hide()
+                self.breadcrumb_row.show()
+                self._render_breadcrumb()
+
+                grouped = bool(self.settings.get("group_by_category")) and self.category_filter is None
+
+                if grouped:
+                    groups = self._grouped_items()
+                    all_ids = {it["id"] for _, items in groups for it in items}
+                    self.selected_ids &= all_ids
+                    if not groups:
+                        self._sections_layout.addWidget(self.empty_label)
+                    else:
+                        for label, items in groups:
+                            section_specs.append((label, items, None))
+                            items_to_show.extend(items)
+                else:
+                    items = self._visible_items()
+                    self.selected_ids &= {it["id"] for it in items}
+                    if not items:
+                        self._sections_layout.addWidget(self.empty_label)
+                    else:
+                        section_specs.append((None, items, None))
+                        items_to_show = items
+
+            use_shadow = (not compact) and len(items_to_show) <= 36
+            for label, items, path_map in section_specs:
+                self._add_section(label, items, compact, path_map=path_map, use_shadow=use_shadow)
+
             self._sections_layout.addStretch(1)
             self._relayout_sections()
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+            self.grid_container.update()
+
+    def _schedule_relayout_sections(self) -> None:
+        self._relayout_timer.start()
+
+    def _on_tile_icon_loaded(self, item_id: str, image) -> None:
+        tile = self._tile_by_id.get(item_id)
+        if tile is None:
+            return
+        tile.apply_icon_image(image)
+
+    def _request_tile_icon(self, tile: TileWidget) -> None:
+        if tile._is_broken or tile._is_url:
+            return
+        if tile.item["type"] not in ("folder", "shortcut"):
             return
 
-        self.search_status_label.hide()
-        self.breadcrumb_row.show()
-        self._render_breadcrumb()
+        cache_key = _tile_icon_cache_key(tile.item, tile._icon_px, tile._sibling_items)
+        if cache_key is not None and cache_key in _PIXMAP_CACHE:
+            pixmap = _PIXMAP_CACHE[cache_key]
+            if tile._icon_label is not None and not pixmap.isNull():
+                tile._icon_label.setPixmap(
+                    pixmap.scaled(
+                        tile._icon_px,
+                        tile._icon_px,
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                )
+                tile._icon_label.setText("")
+            return
 
-        grouped = bool(self.settings.get("group_by_category")) and self.category_filter is None
-
-        if grouped:
-            groups = self._grouped_items()
-            all_ids = {it["id"] for _, items in groups for it in items}
-            self.selected_ids &= all_ids
-            if not groups:
-                self._sections_layout.addWidget(self.empty_label)
-            else:
-                for label, items in groups:
-                    self._add_section(label, items, compact)
-        else:
-            items = self._visible_items()
-            self.selected_ids &= {it["id"] for it in items}
-            if not items:
-                self._sections_layout.addWidget(self.empty_label)
-            else:
-                self._add_section(None, items, compact)
-
-        self._sections_layout.addStretch(1)
-        self._relayout_sections()
+        item_id = tile.item["id"]
+        _ICON_LOADER.request(item_id, tile.load_icon_image)
 
     def _add_section(
-        self, label: str | None, items: list[dict], compact: bool, path_map: dict[str, str] | None = None,
+        self, label: str | None, items: list[dict], compact: bool,
+        path_map: dict[str, str] | None = None, use_shadow: bool = True,
     ) -> None:
         section = QWidget()
         section_layout = QVBoxLayout(section)
@@ -1692,14 +2119,17 @@ class MainWindow(QMainWindow):
 
         categories = self.settings.get("categories", {})
         path_display_mode = self.settings.get("path_display", DEFAULT_PATH_DISPLAY)
-        for item in items:
+        limit = getattr(self, "_render_limit", RENDER_PAGE)
+        child_counts = getattr(self, "_child_counts", None)
+        for item in items[:limit]:
             subtitle_override = path_map.get(item["id"]) if path_map else None
             tile = TileWidget(
                 item, self.colors, self.shortcuts, categories=categories, compact=compact,
                 subtitle_override=subtitle_override, path_display_mode=path_display_mode,
+                use_shadow=use_shadow, child_counts=child_counts,
             )
             tile.clicked_with_modifiers.connect(self.handle_tile_click)
-            tile.double_clicked.connect(self.open_item)
+            tile.double_clicked.connect(self._open_item_later)
             tile.context_requested.connect(self.show_context_menu)
             tile.drag_started.connect(self.begin_drag)
             tile.drag_hover.connect(self.update_drop_indicator)
@@ -1712,9 +2142,24 @@ class MainWindow(QMainWindow):
             flow.addWidget(tile)
             self._tiles.append(tile)
             self._tile_by_id[item["id"]] = tile
+            self._request_tile_icon(tile)
+
+        if len(items) > limit:
+            more = QPushButton(f"Mostrar más  ({len(items) - limit} restantes)")
+            more.setObjectName("ghostButton")
+            more.setCursor(QCursor(Qt.PointingHandCursor))
+            more.clicked.connect(self._show_more_tiles)
+            section_layout.addWidget(more, alignment=Qt.AlignLeft)
 
         self._sections_layout.addWidget(section)
         self._flow_sections.append((flow_widget, flow))
+
+    def _show_more_tiles(self) -> None:
+        bar = self.scroll_area.verticalScrollBar()
+        position = bar.value()
+        self._render_limit = getattr(self, "_render_limit", RENDER_PAGE) + RENDER_PAGE
+        self.refresh()
+        QTimer.singleShot(0, lambda: bar.setValue(position))
 
     def _relayout_sections(self) -> None:
         # Qt no propaga bien "altura según ancho" (heightForWidth) a través
@@ -1733,7 +2178,16 @@ class MainWindow(QMainWindow):
 
     # -- acciones ----------------------------------------------------
 
+    def _open_item_later(self, item: dict) -> None:
+        """Abre el elemento en cuanto el evento de ratón de la tarjeta haya
+        terminado del todo (ver TileWidget.mouseDoubleClickEvent)."""
+        QTimer.singleShot(0, lambda it=item: self.open_item(it))
+
     def open_item(self, item: dict) -> None:
+        def live_name(it: dict) -> str:
+            live_it = next((x for x in self.shortcuts if x["id"] == it["id"]), None)
+            return (live_it or it)["name"]
+
         if item["type"] == "folder":
             if self.search_query:
                 self.breadcrumb = self._breadcrumb_chain_for(item["id"])
@@ -1742,12 +2196,25 @@ class MainWindow(QMainWindow):
                 self.search_box.clear()
                 self.search_box.blockSignals(False)
             else:
-                self.breadcrumb.append((item["name"], item["id"]))
+                self.breadcrumb.append((live_name(item), item["id"]))
             self.current_folder_id = item["id"]
             self.category_filter = None
             self.selected_ids = set()
             self.refresh()
             return
+        if item["type"] == "shortcut":
+            # Acceso que apunta a una CARPETA (o a un .lnk de carpeta): en
+            # vez de lanzar el Explorador se abre dentro de la app,
+            # convirtiéndolo en carpeta interna con su contenido. Para
+            # verla en el Explorador: menú contextual > "Abrir en el Explorador".
+            target = disk_folder_target(item["path"])
+            if target and self._open_disk_folder_inside(item, target):
+                return
+            if not target and str(item["path"]).lower().endswith(".lnk"):
+                get_logger().info(
+                    "Acceso .lnk que no se abre dentro de la app (destino no resuelto o no es carpeta): %s",
+                    item["path"],
+                )
         try:
             if item["type"] == "url":
                 open_url(item["url"])
@@ -1761,11 +2228,297 @@ class MainWindow(QMainWindow):
             record_item_opened(self.shortcuts, item["id"])
             save_shortcuts(self.shortcuts)
 
+    def _graft_disk_entries(self, live: dict, entries: list[dict]) -> None:
+        """Cuelga del elemento `live` (ya carpeta) el contenido escaneado.
+        `entries[0]` es la carpeta raíz del escaneo (se descarta: `live`
+        ocupa su lugar); sus hijos directos pasan a colgar de `live`."""
+        root = entries[0]
+        for entry in entries[1:]:
+            if entry["parent_id"] == root["id"]:
+                entry["parent_id"] = live["id"]
+        live["source_path"] = root.get("source_path") or live.get("source_path", "")
+        self.shortcuts.extend(entries[1:])
+
+    def _open_disk_folder_inside(self, item: dict, target: str) -> bool:
+        """Convierte el acceso a carpeta `item` en carpeta interna (con el
+        árbol de `target` dentro) y navega a ella. Devuelve False si no se
+        pudo leer la carpeta (para que el llamador la abra en el Explorador)."""
+        try:
+            os.listdir(target)
+        except OSError:
+            return False
+
+        entries = self._import_folder_tree(target, item.get("parent_id"), item.get("order", 0))
+        if entries is None:  # el usuario canceló: no se hace nada
+            return True
+
+        live = next((it for it in self.shortcuts if it["id"] == item["id"]), None)
+        if live is None:
+            return True
+        self.push_undo("abrir carpeta")
+        live["type"] = "folder"
+        live.pop("path", None)
+        self._graft_disk_entries(live, entries)
+        save_shortcuts(self.shortcuts)
+        self.open_item(live)  # ya es carpeta: navega dentro
+        return True
+
+    def _external_folder_target(self, item: dict) -> str | None:
+        """Carpeta real del disco asociada a este elemento (acceso a
+        carpeta, o carpeta importada), o None."""
+        if item["type"] == "shortcut":
+            return disk_folder_target(item["path"])
+        if item["type"] == "folder" and item.get("source_path"):
+            return disk_folder_target(item["source_path"])
+        return None
+
+    def _open_in_explorer(self, path: str) -> None:
+        try:
+            open_path(path)
+        except (FileNotFoundError, OSError) as exc:
+            QMessageBox.warning(self, "Error al abrir", str(exc))
+
+    def _refresh_folder_from_disk(self, folder: dict) -> None:
+        """Vuelve a leer del disco el contenido de una carpeta importada,
+        sustituyendo lo que hubiera dentro."""
+        target = disk_folder_target(folder.get("source_path", ""))
+        if not target:
+            QMessageBox.warning(
+                self, "Carpeta no disponible",
+                "La carpeta original ya no existe o no es accesible desde este equipo.",
+            )
+            return
+        answer = QMessageBox.question(
+            self, "Actualizar desde disco",
+            f"Se volverá a leer «{target}» y se sustituirá todo lo que hay dentro de "
+            f"«{folder['name']}» (se pierden los cambios hechos ahí: nombres, colores, orden...).\n\n"
+            "Se puede deshacer con Ctrl+Z. ¿Continuar?",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        entries = self._import_folder_tree(target, folder.get("parent_id"), folder.get("order", 0))
+        if entries is None:
+            return
+        live = next((it for it in self.shortcuts if it["id"] == folder["id"]), None)
+        if live is None:
+            return
+        self.push_undo("actualizar carpeta")
+        doomed: set[str] = set()
+        pending = [live["id"]]
+        while pending:
+            current = pending.pop()
+            for it in self.shortcuts:
+                if it["parent_id"] == current and it["id"] not in doomed:
+                    doomed.add(it["id"])
+                    pending.append(it["id"])
+        self.shortcuts = [it for it in self.shortcuts if it["id"] not in doomed]
+        live = next(it for it in self.shortcuts if it["id"] == folder["id"])
+        self._graft_disk_entries(live, entries)
+        save_shortcuts(self.shortcuts)
+        self.selected_ids = set()
+        self.refresh()
+
     # -- búsqueda ---------------------------------------------------------
 
     def _on_search_changed(self, text: str) -> None:
-        self.search_query = text.strip().lower()
+        self._pending_search_text = text.strip().lower()
+        self._search_debounce.start()
+
+    def _apply_search_query(self) -> None:
+        self.search_query = self._pending_search_text
         self.refresh()
+
+    _UNEXPLORED_TTL = 600.0  # segundos que se recuerda si una ruta es carpeta
+
+    def _unexplored_cached(self, path: str):
+        """(sabido, carpeta_real|None) según la caché de la sesión."""
+        hit = self._unexplored_cache.get(path)
+        if hit is None or time.monotonic() - hit[0] > self._UNEXPLORED_TTL:
+            return False, None
+        return True, hit[1]
+
+    def _unexplored_folder_items(self) -> list[dict]:
+        """Accesos que apuntan a una carpeta del disco y todavía no se han
+        importado. Solo consulta la caché: el escaneo real lo hace
+        `UnexploredScanWorker` en segundo plano."""
+        found: list[dict] = []
+        for it in self.shortcuts:
+            if it["type"] != "shortcut" or not it.get("path"):
+                continue
+            known, target = self._unexplored_cached(it["path"])
+            if known and target:
+                found.append(it)
+        return found
+
+    def _paths_to_scan(self) -> list[str]:
+        """Rutas aún sin comprobar. Las que casi seguro son archivos (por su
+        extensión) se descartan sin tocar el disco."""
+        now = time.monotonic()
+        pending: dict[str, None] = {}
+        for it in self.shortcuts:
+            if it["type"] != "shortcut" or not it.get("path"):
+                continue
+            path = it["path"]
+            if self._unexplored_cached(path)[0]:
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if ext in KNOWN_FILE_EXTS:
+                self._unexplored_cache[path] = (now, None)
+                continue
+            pending[path] = None
+        return list(pending)
+
+    def _update_search_banner(self) -> None:
+        if self._explore_worker is not None:
+            self.search_banner.show()  # modo progreso: lo gestionan _on_explore_progress/_finish
+            return
+        if not self.search_query:
+            self._explore_dismissed = False
+            self.search_banner.hide()
+            return
+        if self._explore_dismissed:
+            self.search_banner.hide()
+            return
+        to_scan = self._paths_to_scan()
+        if to_scan:
+            self.search_banner.hide()
+            if self._scan_worker is None:
+                worker = UnexploredScanWorker(to_scan)
+                worker.scanned.connect(self._on_unexplored_scanned)
+                worker.finished.connect(worker.deleteLater)
+                self._scan_worker = worker
+                worker.start()
+            return
+        count = len(self._unexplored_folder_items())
+        if count == 0:
+            self.search_banner.hide()
+            return
+        self._set_banner_mode("ask")
+        self.search_banner_label.setText(
+            f"Hay {count} carpeta(s) sin explorar: los archivos de dentro no aparecen en la búsqueda. "
+            "¿Explorarlas ahora para buscar también ahí?"
+        )
+        self.search_banner.show()
+
+    def _on_unexplored_scanned(self, result: dict) -> None:
+        now = time.monotonic()
+        for path, target in result.items():
+            self._unexplored_cache[path] = (now, target)
+        self._scan_worker = None
+        self._update_search_banner()
+
+    def _set_banner_mode(self, mode: str) -> None:
+        asking = mode == "ask"
+        self._banner_explore_button.setVisible(asking)
+        self._banner_dismiss_button.setVisible(asking)
+        self._banner_cancel_button.setVisible(not asking)
+
+    def _dismiss_search_banner(self) -> None:
+        self._explore_dismissed = True
+        self.search_banner.hide()
+
+    def explore_unexplored_folders(self) -> None:
+        """Importa todas las carpetas sin explorar. La lectura del disco va
+        en segundo plano (la ventana no se congela y no se abre ninguna
+        ventana emergente: el progreso se ve en la propia franja)."""
+        if self._explore_worker is not None:
+            return
+        jobs = []
+        for it in self._unexplored_folder_items():
+            _known, target = self._unexplored_cached(it["path"])
+            if target:
+                jobs.append((it["id"], it["name"], target, it.get("parent_id"), it.get("order", 0)))
+        if not jobs:
+            self._update_search_banner()
+            return
+
+        self.push_undo("explorar carpetas")
+        self._explore_state = {
+            "total": len(jobs), "explored": 0, "truncated": [], "failed": [],
+            "cancelled": False, "limit_reached": False,
+        }
+        self._set_banner_mode("progress")
+        self.search_banner_label.setText(f"Explorando carpetas... 0/{len(jobs)}")
+        self.search_banner.show()
+
+        worker = ExploreWorker(jobs)
+        worker.progress.connect(self._on_explore_progress)
+        worker.folder_done.connect(self._on_explore_folder_done)
+        worker.folder_failed.connect(self._on_explore_folder_failed)
+        worker.finished.connect(self._on_explore_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._explore_worker = worker
+        worker.start()
+
+    def _on_explore_progress(self, done: int, total: int, name: str) -> None:
+        self.search_banner_label.setText(f"Explorando carpetas... {done}/{total}  ·  {name}")
+
+    def _on_explore_folder_done(self, item_id: str, entries: list, stats: dict) -> None:
+        state = self._explore_state
+        if len(self.shortcuts) > EXPLORE_TOTAL_LIMIT:
+            state["limit_reached"] = True
+            if self._explore_worker is not None:
+                self._explore_worker.requestInterruption()
+            return
+        live = next((it for it in self.shortcuts if it["id"] == item_id), None)
+        if live is None or live["type"] != "shortcut":
+            return
+        if stats.get("truncated"):
+            state["truncated"].append(live["name"])
+        live["type"] = "folder"
+        live.pop("path", None)
+        self._graft_disk_entries(live, entries)
+        state["explored"] += 1
+
+    def _on_explore_folder_failed(self, item_id: str, name: str) -> None:
+        self._explore_state["failed"].append(name)
+
+    def _cancel_exploration(self) -> None:
+        if self._explore_worker is not None:
+            self._explore_state["cancelled"] = True
+            self._explore_worker.requestInterruption()
+            self.search_banner_label.setText("Cancelando...")
+
+    def _on_explore_finished(self) -> None:
+        state = self._explore_state
+        self._explore_worker = None
+        save_shortcuts(self.shortcuts)
+        self._unexplored_cache.clear()
+        self._set_banner_mode("ask")
+        self.refresh()
+
+        notes: list[str] = []
+        if state.get("cancelled"):
+            notes.append("Cancelaste la exploración: las carpetas restantes siguen sin explorar.")
+        if state.get("limit_reached"):
+            notes.append(f"Se paró al superar {EXPLORE_TOTAL_LIMIT} elementos en total para no ralentizar la app.")
+        if state.get("truncated"):
+            names = state["truncated"]
+            notes.append(
+                f"Estas carpetas superaban {FOLDER_IMPORT_MAX_ITEMS} elementos y se importaron recortadas: "
+                + ", ".join(names[:5]) + ("..." if len(names) > 5 else "")
+            )
+        if state.get("failed"):
+            names = state["failed"]
+            notes.append("No se pudieron leer: " + ", ".join(names[:5]) + ("..." if len(names) > 5 else ""))
+        if notes:
+            QMessageBox.information(
+                self, "Explorar carpetas",
+                f"Carpetas exploradas: {state.get('explored', 0)}.\n\n" + "\n".join(notes)
+                + "\n\nSe puede deshacer con Ctrl+Z.",
+            )
+
+    def _stop_background_workers(self) -> None:
+        """Al salir: pide parar a los hilos y espera un momento (Qt se queja
+        si se destruye un QThread que sigue ejecutándose)."""
+        for name in ("_explore_worker", "_scan_worker", "_update_check_thread", "_update_install_thread"):
+            worker = getattr(self, name, None)
+            try:
+                if worker is not None and worker.isRunning():
+                    worker.requestInterruption()
+                    worker.wait(3000)
+            except RuntimeError:
+                pass
 
     def _search_results(self) -> list[dict]:
         query = self.search_query
@@ -1786,6 +2539,25 @@ class MainWindow(QMainWindow):
             guard += 1
         chain.reverse()
         return [("Inicio", None)] + chain
+
+    def _build_path_map(self, items: list[dict]) -> dict[str, str]:
+        """«En: Inicio › A › B» de cada elemento, recorriendo el árbol una sola
+        vez (antes se reconstruía un índice de todo por cada resultado)."""
+        by_id = {it["id"]: it for it in self.shortcuts}
+        chain_cache: dict[str | None, str] = {None: "En: Inicio"}
+
+        def chain_text(folder_id: str | None) -> str:
+            if folder_id in chain_cache:
+                return chain_cache[folder_id]
+            node = by_id.get(folder_id)
+            if node is None:
+                text = "En: Inicio"
+            else:
+                text = chain_text(node["parent_id"]) + " › " + node["name"]
+            chain_cache[folder_id] = text
+            return text
+
+        return {it["id"]: chain_text(it.get("parent_id")) for it in items}
 
     def _path_to_item(self, item: dict) -> str:
         chain = self._breadcrumb_chain_for(item.get("parent_id"))
@@ -1948,6 +2720,17 @@ class MainWindow(QMainWindow):
         added = 0
         new_entries: list[dict] = []
         for raw_path in paths:
+            # Una CARPETA real soltada desde el Explorador no se guarda como
+            # un único acceso a esa ruta: se importa todo su contenido como
+            # carpeta interna con sus subcarpetas y archivos dentro.
+            if Path(raw_path).is_dir():
+                imported = self._import_folder_tree(raw_path, parent_id, len(siblings) + added)
+                if imported is None:  # el usuario canceló
+                    continue
+                new_entries.extend(imported)
+                added += 1
+                continue
+
             # Accesos directos de Windows (.lnk): en vez de guardar la ruta
             # al propio .lnk, se intenta resolver el destino REAL al que
             # apunta (por ejemplo el .exe de un programa), que es lo que
@@ -1955,7 +2738,7 @@ class MainWindow(QMainWindow):
             # puede resolver (algunos .lnk usan formatos que este parser
             # ligero no cubre), se guarda el .lnk tal cual como respaldo.
             display_name = Path(raw_path).stem if raw_path.lower().endswith(".lnk") else Path(raw_path).name
-            resolved = resolve_lnk_target(raw_path) if raw_path.lower().endswith(".lnk") else None
+            resolved = resolve_lnk_target(raw_path, allow_slow=True) if raw_path.lower().endswith(".lnk") else None
             actual_path = resolved or raw_path
 
             portable = portabilize_path(actual_path)
@@ -1984,6 +2767,34 @@ class MainWindow(QMainWindow):
             save_shortcuts(self.shortcuts)
             self.refresh()
 
+    def _import_folder_tree(self, folder_path: str, parent_id: str | None, order: int) -> list[dict] | None:
+        """Escanea `folder_path` y devuelve las entradas (carpetas internas +
+        accesos a archivos) que reproducen su árbol, o None si el usuario
+        cancela al avisarle de que es muy grande."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            entries, stats = build_folder_tree_items(folder_path, parent_id, order)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Solo se pregunta si la carpeta supera el tope y hay que recortarla
+        # (el resto de carpetas, aunque sean grandes, se importan sin avisar).
+        if stats["truncated"]:
+            text = (
+                f"«{Path(folder_path).name or folder_path}» contiene muchísimos elementos: "
+                f"se importarían solo los primeros {FOLDER_IMPORT_MAX_ITEMS} "
+                f"({stats['folders']} carpeta(s) y {stats['files']} archivo(s)); el resto se omite."
+            )
+            answer = QMessageBox.question(self, "Importar carpeta", text + "\n\n¿Importar de todos modos?")
+            if answer != QMessageBox.Yes:
+                return None
+        if stats["skipped"]:
+            get_logger().info(
+                "Importar carpeta %s: %d elemento(s) omitidos (sin permiso / ocultos / enlaces)",
+                folder_path, stats["skipped"],
+            )
+        return entries
+
     # -- teclado ----------------------------------------------------------
 
     def keyPressEvent(self, event) -> None:
@@ -2009,6 +2820,10 @@ class MainWindow(QMainWindow):
         elif key == Qt.Key_Escape:
             self.selected_ids = set()
             self._refresh_selection_visuals()
+        elif key == Qt.Key_F2 and len(self.selected_ids) == 1:
+            item = next((it for it in self.shortcuts if it["id"] in self.selected_ids), None)
+            if item is not None:
+                self.rename_item(item)
         elif key in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected_ids:
             items = [it for it in self.shortcuts if it["id"] in self.selected_ids]
             self._delete_items(items)
@@ -2052,6 +2867,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if len(selected_items) <= 1:
             menu.addAction("Abrir", lambda: self.open_item(item))
+            external = self._external_folder_target(item)
+            if external:
+                menu.addAction("📂 Abrir en el Explorador", lambda p=external: self._open_in_explorer(p))
+            if item["type"] == "folder" and item.get("source_path"):
+                menu.addAction("🔄 Actualizar desde la carpeta original", lambda: self._refresh_folder_from_disk(item))
             menu.addSeparator()
             menu.addAction("Renombrar...", lambda: self.rename_item(item))
         menu.addMenu(self._build_category_assignment_menu(selected_items or [item]))
@@ -2118,11 +2938,20 @@ class MainWindow(QMainWindow):
         self._assign_category(items, name)
 
     def rename_item(self, item: dict) -> None:
-        name, ok = QInputDialog.getText(self, "Renombrar", "Nuevo nombre:", text=item["name"])
+        # Las señales de las tarjetas (Signal(dict)) entregan una COPIA del
+        # diccionario, no el original de self.shortcuts: por eso hay que
+        # buscar el elemento real por su id; si no, el cambio se hace sobre
+        # la copia y se pierde (era la causa de que renombrar no funcionara).
+        live = next((it for it in self.shortcuts if it["id"] == item["id"]), None)
+        if live is None:
+            return
+        name, ok = QInputDialog.getText(self, "Renombrar", "Nuevo nombre:", text=live["name"])
         if ok and name.strip():
             self.push_undo("renombrar")
-            item["name"] = name.strip()
+            live["name"] = name.strip()
             save_shortcuts(self.shortcuts)
+            # refresh() reconstruye tarjetas, árbol lateral (_populate_sidebar)
+            # y migas de pan (_render_breadcrumb) desde self.shortcuts.
             self.refresh()
 
     # -- deshacer / rehacer -------------------------------------------------
@@ -2134,14 +2963,14 @@ class MainWindow(QMainWindow):
     # algo más de memoria — asumible para unas pocas decenas de pasos.
 
     def push_undo(self, label: str) -> None:
-        snapshot = (label, copy.deepcopy(self.shortcuts), copy.deepcopy(load_trash()))
+        snapshot = (label, [dict(it) for it in self.shortcuts], [dict(it) for it in load_trash()])
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._UNDO_LIMIT:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
 
     def _current_snapshot(self, label: str) -> tuple[str, list, list]:
-        return (label, copy.deepcopy(self.shortcuts), copy.deepcopy(load_trash()))
+        return (label, [dict(it) for it in self.shortcuts], [dict(it) for it in load_trash()])
 
     def undo(self) -> None:
         if not self._undo_stack:
@@ -2471,11 +3300,24 @@ class MainWindow(QMainWindow):
 
     def add_shortcut_dialog(self) -> None:
         menu = QMenu(self)
-        menu.addAction("📄  Acceso a un archivo", self.add_file_shortcut)
-        menu.addAction("📁  Acceso a una carpeta del sistema", self.add_folder_shortcut)
-        menu.addAction("🌐  Acceso a una URL", self.add_url_shortcut)
-        menu.addAction("🗂  Carpeta para organizar", self.add_internal_folder)
+        self._fill_add_menu(menu)
         menu.exec(QCursor.pos())
+
+    def _fill_add_menu(self, menu: QMenu) -> None:
+        menu.addAction("🗂  Nueva carpeta (para organizar mis accesos)", self.add_internal_folder)
+        menu.addSeparator()
+        menu.addAction("📄  Añadir un archivo o programa", self.add_file_shortcut)
+        menu.addAction("📁  Añadir una carpeta del PC", self.add_folder_shortcut)
+        menu.addAction("🌐  Añadir una página web (URL)", self.add_url_shortcut)
+
+    def show_background_menu(self, global_pos) -> None:
+        """Clic derecho en un hueco vacío de la cuadrícula."""
+        menu = QMenu(self)
+        self._fill_add_menu(menu)
+        if self._clipboard:
+            menu.addSeparator()
+            menu.addAction("Pegar\tCtrl+V", self.paste_clipboard)
+        menu.exec(global_pos)
 
     def add_url_shortcut(self) -> None:
         colors = self.colors
@@ -2946,6 +3788,7 @@ class MainWindow(QMainWindow):
         def clear_icon_cache() -> None:
             size_before = win_icons.disk_cache_size_bytes()
             win_icons.clear_disk_cache()
+            _PIXMAP_CACHE.clear()
             if size_before:
                 cache_label.setText("Caché de iconos en disco: 0 KB")
                 QMessageBox.information(
@@ -3235,10 +4078,22 @@ class MainWindow(QMainWindow):
 
     # -- actualizaciones ---------------------------------------------------
 
+    def _auto_check_updates(self) -> None:
+        if self.settings.get("auto_check_updates", True):
+            self.check_updates_dialog(manual=False)
+
+    def _on_app_state_changed(self, state) -> None:
+        if state != Qt.ApplicationActive:
+            return
+        if time.monotonic() - self._last_update_check > 180:
+            self._auto_check_updates()
+
     def check_updates_dialog(self, manual: bool) -> None:
         if self._update_check_thread is not None and self._update_check_thread.isRunning():
             return  # ya hay una comprobación en marcha
         self._manual_check = manual
+        self._last_update_check = time.monotonic()
+        get_logger().info("Buscando actualizaciones (%s)...", "manual" if manual else "automática")
         self.update_icon.setToolTip("Buscando actualizaciones...")
         self.update_icon.setText("⏳")
         thread = UpdateCheckWorker()
@@ -3249,24 +4104,60 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_update_check_result(self, update: UpdateInfo | None) -> None:
-        self.update_icon.setText("🔄")
-        self.update_icon.setToolTip("Buscar actualizaciones")
         self._update_check_thread = None
+        self._update_failures = 0
         if update is None:
+            hora = time.strftime("%H:%M")
+            self.update_icon.setText("🔄")
+            self.update_icon.setToolTip(f"Estás al día (v{get_app_version()}). Última comprobación: {hora}. Clic para volver a buscar.")
+            self._pending_update = None
+            self.update_banner.hide()
             if self._manual_check:
                 QMessageBox.information(self, "Actualizaciones", "Ya tienes la última versión instalada.")
             return
+        get_logger().info("Hay una versión nueva: %s (instalada %s)", update.latest_version, update.current_version)
         self._pending_update = update
         self.update_icon.setText("🟢")
         self.update_icon.setToolTip(f"Hay una versión nueva disponible: {update.latest_version}")
-        self._prompt_install(update)
+        if self._manual_check:
+            self._prompt_install(update)
+            return
+        # Automática: sin ventanas emergentes. Franja visible en la app y,
+        # si está minimizada en la bandeja, una notificación (una vez por versión).
+        if update.latest_version != self._dismissed_update_version:
+            self.update_banner_label.setText(
+                f"Hay una versión nueva: {update.latest_version} (tienes {update.current_version})."
+                + (f"  {update.notes}" if update.notes else "")
+            )
+            self.update_banner.show()
+        if update.latest_version != self._notified_update_version:
+            self._notified_update_version = update.latest_version
+            if self._tray_icon is not None and not self.isVisible():
+                self._tray_icon.showMessage(
+                    "Accesos Directos",
+                    f"Hay una versión nueva ({update.latest_version}). Abre la app para actualizar.",
+                )
 
     def _on_update_check_failed(self, message: str) -> None:
-        self.update_icon.setText("🔄")
-        self.update_icon.setToolTip("Buscar actualizaciones")
         self._update_check_thread = None
+        self._update_failures += 1
+        get_logger().warning("No se pudo comprobar si hay actualizaciones: %s", message)
+        self.update_icon.setText("⚠️")
+        self.update_icon.setToolTip(f"No se pudo comprobar las actualizaciones:\n{message}\n\nClic para reintentar.")
         if self._manual_check:
             QMessageBox.warning(self, "No se pudo comprobar", message)
+        elif self._update_failures <= 3:
+            # Red aún no disponible al arrancar, VPN que tarda... reintenta pronto.
+            QTimer.singleShot(60 * 1000, self._auto_check_updates)
+
+    def _install_pending_update(self) -> None:
+        if self._pending_update is not None:
+            self._start_install(self._pending_update)
+
+    def _dismiss_update_banner(self) -> None:
+        if self._pending_update is not None:
+            self._dismissed_update_version = self._pending_update.latest_version
+        self.update_banner.hide()
 
     def _prompt_install(self, update: UpdateInfo) -> None:
         answer = QMessageBox.question(

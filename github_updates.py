@@ -1,7 +1,19 @@
-"""Comprobación e instalación de actualizaciones desde GitHub."""
+"""Comprobación e instalación de actualizaciones.
+
+Origen configurable (ver UPDATE_SOURCE en app_config.py):
+  - "folder": carpeta compartida de la empresa (UNC / unidad de red).
+  - "http":   servidor web interno.
+  - "github": GitHub Releases (comportamiento original).
+
+Para "folder" y "http" el origen publica un `latest.json` (lo genera
+`publicar.py`) con la versión y el .zip + su SHA-256. El nombre del módulo
+se mantiene (github_updates) para no romper las instalaciones existentes,
+cuyo auto-actualizador solo conoce los archivos listados en UPDATE_FILES.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -10,12 +22,23 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from app_config import APP_DIR, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, VERSION_FILE, get_app_version
+from app_config import (
+    APP_DIR,
+    GITHUB_OWNER,
+    GITHUB_REPO,
+    GITHUB_TOKEN,
+    UPDATE_MANIFEST_NAME,
+    VERSION_FILE,
+    get_app_version,
+    get_logger,
+    get_update_config,
+)
 
 # Se añade a los argumentos de la nueva instancia cuando se relanza la app
 # muy rápido (tras cambiar el tema o tras actualizar), para que sepa que
@@ -59,7 +82,10 @@ class UpdateInfo:
     current_version: str
     latest_version: str
     release_url: str
-    download_url: str
+    download_url: str  # URL http(s) o ruta de archivo (carpeta de red)
+    sha256: str = ""  # vacío solo en modo "github" (ahí no hay manifiesto)
+    token: str = ""  # para descargar (modo "http" con token / GitHub privado)
+    notes: str = ""
 
 
 class UpdateError(Exception):
@@ -102,7 +128,111 @@ def _github_request(url: str, token: str = "") -> dict:
         raise UpdateError(f"No se pudo conectar con GitHub: {exc.reason}") from exc
 
 
+# --- Orígenes privados (carpeta de red / servidor interno) ----------------
+
+_SAFE_FILE_NAME = re.compile(r"^[\w.\- ()]+$")
+
+
+def _manifest_asset(manifest: dict) -> tuple[str, str]:
+    """(nombre_de_archivo, sha256) del paquete que corresponde a esta
+    instalación: "exe" si es la app compilada, "source" si son .py."""
+    key = "exe" if getattr(sys, "frozen", False) else "source"
+    asset = manifest.get(key)
+    if not isinstance(asset, dict) or not asset.get("file"):
+        raise UpdateError(
+            f"La versión publicada no incluye el paquete «{key}» para este tipo de instalación."
+        )
+    name = str(asset["file"])
+    sha = str(asset.get("sha256", "")).strip().lower()
+    if not _SAFE_FILE_NAME.match(name) or name in (".", ".."):
+        raise UpdateError("El manifiesto de actualización tiene un nombre de archivo no válido.")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise UpdateError("El manifiesto de actualización no incluye una suma SHA-256 válida.")
+    return name, sha
+
+
+def _info_from_manifest(manifest: dict, resolve_download, release_url: str, token: str) -> UpdateInfo | None:
+    latest = str(manifest.get("version", "")).strip()
+    if not latest:
+        raise UpdateError("El manifiesto de actualización no indica la versión.")
+    current = get_app_version()
+    get_logger().info("Actualizaciones: versión instalada %s, versión publicada %s", current, latest)
+    if not is_newer_version(current, latest):
+        return None
+    name, sha = _manifest_asset(manifest)
+    return UpdateInfo(
+        current_version=current,
+        latest_version=latest,
+        release_url=release_url,
+        download_url=resolve_download(name),
+        sha256=sha,
+        token=token,
+        notes=str(manifest.get("notes", "")),
+    )
+
+
+def _check_folder(folder: str) -> UpdateInfo | None:
+    if not folder:
+        raise UpdateError("Configura UPDATE_FOLDER en app_config.py (o update_config.json).")
+    base = Path(folder)
+    manifest_path = base / UPDATE_MANIFEST_NAME
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise UpdateError(
+            f"No se puede acceder a la carpeta de actualizaciones ({folder}). "
+            "¿Estás conectado a la red de la empresa?"
+        ) from exc
+    except ValueError as exc:
+        raise UpdateError(f"El archivo {UPDATE_MANIFEST_NAME} no es un JSON válido.") from exc
+    if not isinstance(manifest, dict):
+        raise UpdateError(f"El archivo {UPDATE_MANIFEST_NAME} no tiene el formato esperado.")
+    return _info_from_manifest(manifest, lambda name: str(base / name), "", "")
+
+
+def _http_json(url: str, token: str = "") -> dict:
+    headers = {"Accept": "application/json", "User-Agent": "AccesosDirectos-Updater"}
+    if token.strip():
+        headers["Authorization"] = f"Bearer {token.strip()}"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise UpdateError("El servidor de actualizaciones rechazó el acceso.") from exc
+        if exc.code == 404:
+            raise UpdateError("No se encontró el manifiesto de actualizaciones en el servidor.") from exc
+        raise UpdateError(f"El servidor de actualizaciones respondió con error {exc.code}.") from exc
+    except urllib.error.URLError as exc:
+        raise UpdateError(
+            f"No se pudo conectar con el servidor de actualizaciones: {exc.reason}"
+        ) from exc
+    except ValueError as exc:
+        raise UpdateError("El manifiesto del servidor no es un JSON válido.") from exc
+
+
+def _check_http(url: str, token: str) -> UpdateInfo | None:
+    if not url.lower().startswith(("https://", "http://")):
+        raise UpdateError("Configura UPDATE_URL (dirección de latest.json) en app_config.py.")
+    manifest = _http_json(url, token)
+    if not isinstance(manifest, dict):
+        raise UpdateError("El manifiesto del servidor no tiene el formato esperado.")
+    return _info_from_manifest(
+        manifest, lambda name: urllib.parse.urljoin(url, name), url, token
+    )
+
+
 def check_for_updates(owner: str = "", repo: str = "", token: str = "") -> UpdateInfo | None:
+    cfg = get_update_config()
+    if cfg["source"] == "folder":
+        return _check_folder(cfg["folder"])
+    if cfg["source"] == "http":
+        return _check_http(cfg["url"], cfg["token"])
+    return _check_github(owner, repo, token)
+
+
+def _check_github(owner: str = "", repo: str = "", token: str = "") -> UpdateInfo | None:
     owner = (owner or GITHUB_OWNER).strip()
     repo = (repo or GITHUB_REPO).strip()
     token = token or GITHUB_TOKEN
@@ -146,6 +276,7 @@ def check_for_updates(owner: str = "", repo: str = "", token: str = "") -> Updat
         latest_version=latest,
         release_url=release.get("html_url", ""),
         download_url=download_url,
+        token=token,
     )
 
 
@@ -194,14 +325,64 @@ def _download_with_progress(request, destination: Path, progress_callback=None) 
                     progress_callback(downloaded, total)
 
 
+def _copy_with_progress(source: Path, destination: Path, progress_callback=None) -> None:
+    """Copia un archivo local/de red a `destination` avisando del avance
+    (equivalente a _download_with_progress para el origen "folder")."""
+    chunk_size = 1024 * 1024
+    try:
+        total = source.stat().st_size
+        copied = 0
+        with source.open("rb") as reader, destination.open("wb") as writer:
+            while True:
+                chunk = reader.read(chunk_size)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                copied += len(chunk)
+                if progress_callback is not None:
+                    progress_callback(copied, total)
+    except OSError as exc:
+        raise UpdateError(f"No se pudo leer el paquete de actualización: {exc}") from exc
+
+
+def _fetch_to_file(location: str, destination: Path, token: str = "", progress_callback=None) -> None:
+    """Deja el paquete en `destination`, venga de una URL http(s) o de una
+    ruta de archivo (carpeta compartida)."""
+    if location.lower().startswith(("http://", "https://")):
+        headers = {"User-Agent": "AccesosDirectos-Updater"}
+        if token.strip():
+            headers["Authorization"] = f"Bearer {token.strip()}"
+        request = urllib.request.Request(location, headers=headers)
+        _download_with_progress(request, destination, progress_callback)
+    else:
+        _copy_with_progress(Path(location), destination, progress_callback)
+
+
+def _verify_sha256(path: Path, expected: str) -> None:
+    """Comprueba la integridad del paquete descargado antes de instalarlo.
+    `expected` vacío = sin comprobación (solo modo GitHub heredado)."""
+    if not expected:
+        return
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest().lower() != expected.strip().lower():
+        raise UpdateError(
+            "El paquete descargado no coincide con la suma SHA-256 publicada "
+            "(archivo dañado o modificado). No se ha instalado nada."
+        )
+
+
 def apply_update(
-    download_url: str, token: str = "", latest_version: str = "", progress_callback=None
+    download_url: str, token: str = "", latest_version: str = "", progress_callback=None,
+    sha256: str = "",
 ) -> None:
     """Descarga e instala la actualización. Se adapta según si es .exe o .py sueltos."""
     if getattr(sys, "frozen", False):
-        _apply_update_exe(download_url, token, latest_version, progress_callback)
+        _apply_update_exe(download_url, token, latest_version, progress_callback, sha256)
     else:
-        _apply_update_source(download_url, token, progress_callback)
+        _apply_update_source(download_url, token, progress_callback, sha256)
 
 
 # ---------------------------------------------------------------------------
@@ -209,22 +390,19 @@ def apply_update(
 # ---------------------------------------------------------------------------
 
 def _apply_update_exe(
-    download_url: str, token: str = "", latest_version: str = "", progress_callback=None
+    download_url: str, token: str = "", latest_version: str = "", progress_callback=None,
+    sha256: str = "",
 ) -> None:
     """Descarga el .zip de la nueva versión (app completa, modo onedir) y
     lo deja ya descomprimido en una carpeta de preparación, lista para
     aplicarse al reiniciar (ver `restart_with_update`)."""
-    headers = {"User-Agent": "AccesosDirectos-Updater"}
-    if token.strip():
-        headers["Authorization"] = f"Bearer {token.strip()}"
-
-    request = urllib.request.Request(download_url, headers=headers)
     app_dir = Path(sys.executable).resolve().parent
     staging_dir = app_dir.parent / f"{app_dir.name}_actualizacion"
     zip_path = Path(tempfile.gettempdir()) / "accesos-directos-actualizacion.zip"
 
     try:
-        _download_with_progress(request, zip_path, progress_callback)
+        _fetch_to_file(download_url, zip_path, token, progress_callback)
+        _verify_sha256(zip_path, sha256)
 
         if staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -232,6 +410,9 @@ def _apply_update_exe(
 
         with zipfile.ZipFile(zip_path, "r") as archive:
             archive.extractall(staging_dir)
+    except UpdateError:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
     except Exception as exc:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise UpdateError(f"No se pudo descargar la actualización: {exc}") from exc
@@ -358,17 +539,12 @@ def restart_with_update(root=None) -> None:
 # ---------------------------------------------------------------------------
 
 def _download_release_zip(download_url: str, token: str = "", progress_callback=None) -> Path:
-    headers = {"User-Agent": "AccesosDirectos-Updater"}
-    if token.strip():
-        headers["Authorization"] = f"Bearer {token.strip()}"
-
-    request = urllib.request.Request(download_url, headers=headers)
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     temp_path = Path(temp_file.name)
     temp_file.close()
 
     try:
-        _download_with_progress(request, temp_path, progress_callback)
+        _fetch_to_file(download_url, temp_path, token, progress_callback)
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
@@ -385,11 +561,14 @@ def _find_repo_root(extracted_dir: Path) -> Path:
     return extracted_dir
 
 
-def _apply_update_source(download_url: str, token: str = "", progress_callback=None) -> None:
+def _apply_update_source(
+    download_url: str, token: str = "", progress_callback=None, sha256: str = ""
+) -> None:
     zip_path = _download_release_zip(download_url, token, progress_callback)
     temp_dir = Path(tempfile.mkdtemp())
 
     try:
+        _verify_sha256(zip_path, sha256)
         with zipfile.ZipFile(zip_path, "r") as archive:
             archive.extractall(temp_dir)
 

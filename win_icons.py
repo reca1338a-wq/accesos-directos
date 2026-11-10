@@ -59,6 +59,7 @@ SHGFI_LARGEICON = 0x000000000
 SHGFI_SMALLICON = 0x000000001
 SHGFI_USEFILEATTRIBUTES = 0x000000010
 FILE_ATTRIBUTE_NORMAL = 0x80
+FILE_ATTRIBUTE_DIRECTORY = 0x10
 DI_NORMAL = 0x0003
 MAX_PATH = 260
 
@@ -139,6 +140,42 @@ def get_icon_image(path: str, size: int = 32):
             _save_to_disk_cache(path, size, image)
     except Exception:
         image = None
+
+    _icon_cache[key] = image
+    return image
+
+
+def get_generic_folder_icon(size: int = 32):
+    """Icono de carpeta normal de Windows (el amarillo de siempre), igual
+    para todas las carpetas internas. Fuera de Windows devuelve None y
+    quien llama usa el emoji 📁 de repuesto."""
+    key = ("<carpeta>", size)
+    if key in _icon_cache:
+        return _icon_cache[key]
+
+    image = None
+    if _ICON_SUPPORTED and Image is not None:
+        try:
+            info = _SHFILEINFOW()
+            flags = (
+                SHGFI_ICON
+                | (SHGFI_LARGEICON if size > 20 else SHGFI_SMALLICON)
+                | SHGFI_USEFILEATTRIBUTES  # no hace falta que la carpeta exista
+            )
+            ctypes.windll.shell32.SHGetFileInfoW(
+                ctypes.c_wchar_p("carpeta"),
+                FILE_ATTRIBUTE_DIRECTORY,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                flags,
+            )
+            if info.hIcon:
+                try:
+                    image = _hicon_to_pil(info.hIcon, size)
+                finally:
+                    ctypes.windll.user32.DestroyIcon(info.hIcon)
+        except Exception:
+            image = None
 
     _icon_cache[key] = image
     return image

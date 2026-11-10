@@ -26,12 +26,35 @@ VERSION_FILE = APP_DIR / "VERSION"
 ICON_FILE = APP_DIR / "icon.ico"
 LEGACY_SHORTCUTS_PATH = APP_DIR / "shortcuts.json"
 
-# Repositorio de GitHub usado para comprobar actualizaciones.
-# Se configura aquí, en el código: el usuario final no puede cambiarlo
-# desde la aplicación.
+# ---------------------------------------------------------------------------
+# Origen de las actualizaciones. Se configura aquí, en el código (o con el
+# archivo opcional `update_config.json` junto al .exe, ver más abajo): el
+# usuario final no puede cambiarlo desde la aplicación.
+#
+#   "folder"  carpeta compartida de la empresa (ruta UNC \\servidor\recurso
+#             o unidad de red). Sin servidor web, sin tokens: el acceso lo
+#             controlan los permisos NTFS/AD de esa carpeta.
+#   "http"    servidor web interno (intranet) que sirve `latest.json` + los
+#             .zip. Útil si los PCs no ven la carpeta de red (p. ej. VPN).
+#   "github"  GitHub Releases (repositorio público, o privado con token).
+#             Es el comportamiento de las versiones anteriores.
+# ---------------------------------------------------------------------------
+UPDATE_SOURCE = "folder"
+UPDATE_FOLDER = r"\\192.168.1.254\AccesosDirectos$"  # UPDATE_SOURCE = "folder"
+UPDATE_URL = ""  # UPDATE_SOURCE = "http", ej. "https://intranet.empresa.local/accesos/latest.json"
+UPDATE_HTTP_TOKEN = ""  # opcional: se envía como "Authorization: Bearer ..." en modo "http"
+
+# UPDATE_SOURCE = "github" (heredado)
 GITHUB_OWNER = "reca1338a-wq"
 GITHUB_REPO = "accesos-directos"
 GITHUB_TOKEN = ""  # Déjalo vacío si el repositorio es público.
+
+UPDATE_SOURCES = ("folder", "http", "github")
+UPDATE_MANIFEST_NAME = "latest.json"
+# Archivo OPCIONAL junto al .exe que sobrescribe lo de arriba sin recompilar
+# (ej. para que TI cambie la ruta del servidor al desplegar). Claves:
+# "source", "folder", "url", "token".
+UPDATE_CONFIG_FILE = APP_DIR / "update_config.json"
 
 if sys.platform == "win32":
     USER_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "AccesosDirectos"
@@ -143,6 +166,28 @@ DEFAULT_SHORTCUTS = [
 ]
 
 
+def get_update_config() -> dict:
+    """Configuración efectiva del origen de actualizaciones: las constantes
+    de arriba, sobrescritas por `update_config.json` si existe."""
+    cfg = {
+        "source": UPDATE_SOURCE,
+        "folder": UPDATE_FOLDER,
+        "url": UPDATE_URL,
+        "token": UPDATE_HTTP_TOKEN,
+    }
+    try:
+        data = json.loads(UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            for key in cfg:
+                if isinstance(data.get(key), str):
+                    cfg[key] = data[key].strip()
+    except (OSError, ValueError):
+        pass
+    if cfg["source"] not in UPDATE_SOURCES:
+        cfg["source"] = "folder"
+    return cfg
+
+
 def get_app_version() -> str:
     if not VERSION_FILE.exists():
         # Primera ejecución del .exe: copiamos el VERSION que va
@@ -165,6 +210,170 @@ def get_theme(name: str) -> dict:
 
 def new_item_id() -> str:
     return str(_uuid.uuid4())
+
+
+def disk_folder_target(path: str, allow_slow: bool = True) -> str | None:
+    """Si `path` (ruta guardada en un acceso) es una CARPETA del disco, o un
+    .lnk cuyo destino es una carpeta, devuelve la ruta real de esa carpeta;
+    si no (archivo, programa, ruta rota...), None. Nunca lanza excepción."""
+    if not path:
+        return None
+    try:
+        # Rutas pegadas a mano con comillas o espacios de más.
+        candidate = expand_path(str(path).strip().strip('"').strip())
+        if candidate.lower().endswith(".lnk"):
+            # `allow_slow` permite el método lento (PowerShell): sí al abrir
+            # UN acceso, no al escanear muchos (p. ej. al buscar).
+            resolved = resolve_lnk_target(candidate, allow_slow=allow_slow)
+            if not resolved:
+                return None
+            candidate = expand_path(resolved.strip().strip('"'))
+        return candidate if Path(candidate).expanduser().is_dir() else None
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Importar una carpeta del disco como árbol de carpetas internas + accesos.
+# ---------------------------------------------------------------------------
+
+# Límites de seguridad: soltar por error "C:\\" no debe congelar la app ni
+# crear cientos de miles de tarjetas.
+FOLDER_IMPORT_MAX_ITEMS = 10000
+FOLDER_IMPORT_MAX_DEPTH = 25
+# A partir de cuántos elementos se pide confirmación antes de importar.
+FOLDER_IMPORT_CONFIRM_THRESHOLD = 200
+_IMPORT_SKIP_NAMES = {"thumbs.db", "desktop.ini", ".ds_store", "$recycle.bin", "system volume information"}
+_WIN_ATTR_HIDDEN_SYSTEM = 0x2 | 0x4  # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+
+
+def _new_entry(item_type: str, name: str, parent_id: str | None, order: int) -> dict:
+    return {
+        "id": new_item_id(),
+        "type": item_type,
+        "name": name,
+        "parent_id": parent_id,
+        "order": order,
+        "color": None,
+        "size": DEFAULT_SIZE,
+        "width": None,
+        "height": None,
+        "category": None,
+        "open_count": 0,
+        "last_opened": 0.0,
+        "favorite": False,
+    }
+
+
+def _is_hidden_entry(entry: "os.DirEntry") -> bool:
+    if entry.name.startswith(".") or entry.name.lower() in _IMPORT_SKIP_NAMES:
+        return True
+    try:
+        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & _WIN_ATTR_HIDDEN_SYSTEM)
+
+
+def build_folder_tree_items(
+    root_path,
+    parent_id: str | None = None,
+    order: int = 0,
+    max_items: int = FOLDER_IMPORT_MAX_ITEMS,
+    max_depth: int = FOLDER_IMPORT_MAX_DEPTH,
+) -> tuple[list[dict], dict]:
+    """Recorre `root_path` y devuelve (entradas, estadísticas) que reproducen
+    su árbol: una carpeta interna por cada carpeta del disco y un acceso
+    directo por cada archivo, con los `parent_id` ya enlazados. La carpeta
+    raíz cuelga de `parent_id` con el `order` indicado.
+
+    - Dentro de cada carpeta van primero las subcarpetas y luego los
+      archivos, ordenados por nombre.
+    - Se omiten archivos/carpetas ocultos o de sistema, y los enlaces
+      simbólicos a carpetas (evita ciclos y salirse del árbol).
+    - Los .lnk se guardan apuntando a su destino real cuando se puede.
+    - Se detiene al llegar a `max_items` (stats["truncated"] = True).
+
+    stats = {"folders": n, "files": n, "skipped": n, "truncated": bool}
+    Solo lee el disco; no modifica nada."""
+    root = Path(root_path)
+    stats = {"folders": 0, "files": 0, "skipped": 0, "truncated": False}
+    entries: list[dict] = []
+    visited: set[str] = set()
+
+    def total() -> int:
+        return len(entries)
+
+    def walk(directory: Path, folder_entry: dict, depth: int) -> None:
+        try:
+            real = os.path.realpath(directory)
+        except OSError:
+            stats["skipped"] += 1
+            return
+        if real in visited or depth > max_depth:
+            stats["skipped"] += 1
+            return
+        visited.add(real)
+
+        try:
+            with os.scandir(directory) as it:
+                children = list(it)
+        except OSError:  # sin permiso, ruta desaparecida...
+            stats["skipped"] += 1
+            return
+
+        subdirs, files = [], []
+        for child in children:
+            if _is_hidden_entry(child):
+                stats["skipped"] += 1
+                continue
+            try:
+                is_dir = child.is_dir(follow_symlinks=False)
+            except OSError:
+                stats["skipped"] += 1
+                continue
+            (subdirs if is_dir else files).append(child)
+            # Un symlink a carpeta no es is_dir(follow_symlinks=False): cae
+            # en `files`; se descarta abajo si apunta a una carpeta.
+
+        subdirs.sort(key=lambda e: e.name.casefold())
+        files.sort(key=lambda e: e.name.casefold())
+
+        position = 0
+        for sub in subdirs:
+            if total() >= max_items:
+                stats["truncated"] = True
+                return
+            entry = _new_entry("folder", sub.name, folder_entry["id"], position)
+            position += 1
+            entries.append(entry)
+            stats["folders"] += 1
+            walk(Path(sub.path), entry, depth + 1)
+
+        for f in files:
+            if total() >= max_items:
+                stats["truncated"] = True
+                return
+            try:
+                if f.is_symlink() and f.is_dir():
+                    stats["skipped"] += 1
+                    continue
+            except OSError:
+                pass
+            is_lnk = f.name.lower().endswith(".lnk")
+            target = (resolve_lnk_target(f.path) if is_lnk else None) or f.path
+            entry = _new_entry("shortcut", Path(f.name).stem if is_lnk else f.name, folder_entry["id"], position)
+            entry["path"] = portabilize_path(target)
+            position += 1
+            entries.append(entry)
+            stats["files"] += 1
+
+    root_entry = _new_entry("folder", root.name or str(root), parent_id, order)
+    root_entry["source_path"] = portabilize_path(str(root))
+    entries.append(root_entry)
+    stats["folders"] += 1
+    walk(root, root_entry, 0)
+    return entries, stats
 
 
 def snap_dimension(value: int, step: int = GRID_SNAP_STEP) -> int:
@@ -485,6 +694,12 @@ def _normalize_items(raw: list) -> list[dict]:
             if not path:
                 continue
             item["path"] = path
+        elif item_type == "folder":
+            # Carpeta importada desde el disco: se recuerda su origen para
+            # poder "Abrir en el Explorador" y "Actualizar desde disco".
+            source_path = str(entry.get("source_path", "") or "").strip()
+            if source_path:
+                item["source_path"] = source_path
         elif item_type == "url":
             url = str(entry.get("url", "")).strip()
             if not url:
@@ -548,9 +763,17 @@ def load_shortcuts() -> list[dict]:
 def save_shortcuts(items: list[dict]) -> None:
     ensure_user_data_dir()
     normalized = _normalize_items(items)
-    with SHORTCUTS_PATH.open("w", encoding="utf-8") as handle:
-        json.dump({"items": normalized}, handle, indent=2, ensure_ascii=False)
+    # Con muchos elementos, JSON compacto (indentar 15000 entradas tarda
+    # y triplica el tamaño). Escritura atómica: a un .tmp y se renombra,
+    # así un corte a mitad de guardado no deja el archivo a medias.
+    tmp_path = SHORTCUTS_PATH.with_name(SHORTCUTS_PATH.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        if len(normalized) <= 300:
+            json.dump({"items": normalized}, handle, indent=2, ensure_ascii=False)
+        else:
+            json.dump({"items": normalized}, handle, separators=(",", ":"), ensure_ascii=False)
         handle.write("\n")
+    os.replace(tmp_path, SHORTCUTS_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +817,7 @@ def _lnk_read_cstring(data: bytes, offset: int, unicode: bool) -> str | None:
         return None
 
 
-def resolve_lnk_target(lnk_path) -> str | None:
+def _resolve_lnk_target_linkinfo(lnk_path) -> str | None:
     """Intenta extraer la ruta de destino real de un acceso directo .lnk
     de Windows, leyendo su formato binario a mano (sin pywin32/COM).
     Devuelve None si el archivo no es un .lnk válido o no se puede
@@ -654,6 +877,112 @@ def resolve_lnk_target(lnk_path) -> str | None:
     except (_struct.error, IndexError):
         return None
     return None
+
+
+def _resolve_lnk_target_idlist(lnk_path) -> str | None:
+    """Segundo intento para los .lnk que NO traen LinkInfo (típico de los
+    accesos a carpetas de red, unidades asignadas o carpetas movidas): se
+    le pasa al propio Windows el LinkTargetIDList del .lnk mediante
+    SHGetPathFromIDListW (shell32, vía ctypes, sin COM ni pywin32). Solo
+    funciona en Windows; en otros sistemas o si falla devuelve None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        data = Path(lnk_path).read_bytes()
+        if len(data) < 78 or data[:20] != _LNK_MAGIC:
+            return None
+        link_flags = _struct.unpack_from("<I", data, 20)[0]
+        if not link_flags & 0x1:  # sin LinkTargetIDList
+            return None
+        size = _struct.unpack_from("<H", data, 76)[0]
+        idlist = data[78:78 + size]
+        if size < 2 or len(idlist) != size:
+            return None
+
+        pidl = ctypes.create_string_buffer(idlist + b"\0\0")  # terminador extra por seguridad
+        shell32 = ctypes.WinDLL("shell32")
+        func = shell32.SHGetPathFromIDListW
+        func.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        func.restype = ctypes.c_int
+        out = ctypes.create_unicode_buffer(260)  # MAX_PATH
+        if func(ctypes.addressof(pidl), out):
+            return out.value or None
+    except Exception:
+        return None
+    return None
+
+
+def _path_exists_safe(path: str) -> bool:
+    try:
+        return os.path.exists(expand_path(path))
+    except (OSError, ValueError):
+        return False
+
+
+_lnk_slow_cache: dict[tuple[str, float], str | None] = {}
+
+
+def _resolve_lnk_target_powershell(lnk_path) -> str | None:
+    """Último recurso (solo Windows): le pregunta a Windows el destino del
+    .lnk con WScript.Shell, que entiende TODOS los tipos de acceso directo
+    (los que solo traen IDList, carpetas de red, OneDrive...). Tarda unas
+    décimas de segundo, por eso solo se usa cuando lo demás falla y al abrir
+    un único acceso. Nunca lanza excepción."""
+    if sys.platform != "win32":
+        return None
+    try:
+        mtime = Path(lnk_path).stat().st_mtime
+    except OSError:
+        return None
+    key = (str(lnk_path), mtime)
+    if key in _lnk_slow_cache:
+        return _lnk_slow_cache[key]
+
+    result = None
+    try:
+        import subprocess
+
+        env = dict(os.environ, LNK_PATH=str(lnk_path))
+        command = (
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+            "(New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK_PATH).TargetPath"
+        )
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, timeout=10, env=env,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW: sin ventana negra
+        )
+        text = done.stdout.decode("utf-8", errors="ignore").strip()
+        result = text or None
+    except Exception:
+        result = None
+    _lnk_slow_cache[key] = result
+    return result
+
+
+def resolve_lnk_target(lnk_path, allow_slow: bool = False) -> str | None:
+    """Destino real de un acceso directo .lnk de Windows, o None.
+
+    Prueba primero la ruta guardada en LinkInfo y, si no existe o el .lnk
+    no la trae, la que resuelve Windows a partir del LinkTargetIDList. Se
+    devuelve el primer destino que EXISTE; si ninguno existe, el primero
+    que se haya podido leer (para que quien llame pueda mostrar un acceso
+    roto en vez de nada). Nunca lanza excepción."""
+    primary = _resolve_lnk_target_linkinfo(lnk_path)
+    if primary and _path_exists_safe(primary):
+        return primary
+    alternative = _resolve_lnk_target_idlist(lnk_path)
+    if alternative and _path_exists_safe(alternative):
+        return alternative
+    if allow_slow:
+        slow = _resolve_lnk_target_powershell(lnk_path)
+        if slow and _path_exists_safe(slow):
+            return slow
+        primary = primary or alternative or slow
+        return primary
+    return primary or alternative
 
 
 # ---------------------------------------------------------------------------
