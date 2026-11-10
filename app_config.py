@@ -39,12 +39,12 @@ LEGACY_SHORTCUTS_PATH = APP_DIR / "shortcuts.json"
 #   "github"  GitHub Releases (repositorio público, o privado con token).
 #             Es el comportamiento de las versiones anteriores.
 # ---------------------------------------------------------------------------
-UPDATE_SOURCE = "folder"
+#UPDATE_SOURCE = "folder"
 UPDATE_FOLDER = r"\\192.168.1.254\AccesosDirectos$"  # UPDATE_SOURCE = "folder"
 UPDATE_URL = ""  # UPDATE_SOURCE = "http", ej. "https://intranet.empresa.local/accesos/latest.json"
 UPDATE_HTTP_TOKEN = ""  # opcional: se envía como "Authorization: Bearer ..." en modo "http"
 
-# UPDATE_SOURCE = "github" (heredado)
+UPDATE_SOURCE = "github"
 GITHUB_OWNER = "reca1338a-wq"
 GITHUB_REPO = "accesos-directos"
 GITHUB_TOKEN = ""  # Déjalo vacío si el repositorio es público.
