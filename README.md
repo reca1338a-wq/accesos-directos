@@ -44,6 +44,14 @@ aún no se han abierto no tienen contenido importado, así que al buscar aparece
 aviso con **Explorar ahora** / **Ahora no**: el primero las importa todas de una vez
 (con barra de progreso y cancelable; se deshace con Ctrl+Z).
 
+## Nombres largos en las tarjetas
+
+El texto de cada tarjeta se ajusta solo a su tamaño (pequeña, mediana, grande o la que
+hayas dado arrastrando la esquina) y nunca se pisa con el icono: primero se prueba el
+tamaño normal; si no cabe, el subtítulo pasa a una línea, luego la letra baja hasta
+10 px con menos margen, y si todavía no cabe se recorta con «…». Al pasar el ratón por
+una tarjeta recortada se ve el nombre completo. Lo mismo en la vista compacta.
+
 ## Rendimiento
 
 - Solo se dibujan 300 tarjetas de golpe por vista (carpetas y resultados de búsqueda enormes);
@@ -86,6 +94,15 @@ con un `update_config.json` junto al `.exe`:
    `latest.json` el último, de forma atómica). Sin `--build` usa lo que ya haya en `dist/main`.
 3. Los clientes lo detectan solos (al arrancar / cada 15 min / botón 🔄), verifican el
    SHA-256 y se actualizan.
+
+### Error «CERTIFICATE_VERIFY_FAILED» al buscar actualizaciones
+
+Pasa en redes que inspeccionan HTTPS (proxy/antivirus de empresa) o en equipos sin los
+certificados raíz al día. La app prueba tres formas de verificar el certificado (siempre
+verificando, nunca se desactiva): `truststore` (certificados de Windows), `certifi` y el
+almacén de Python. Antes de compilar: `pip install -r requirements.txt`. Si aun así falla,
+guarda el certificado de la empresa (formato PEM) como `ca_bundle.pem` junto a la app y
+vuelve a probar. Revisa también que la fecha y hora del equipo sean correctas.
 
 ### Seguridad (importante)
 
