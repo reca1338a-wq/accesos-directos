@@ -46,10 +46,13 @@ from PySide6.QtGui import (
     QDesktopServices,
     QDrag,
     QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QPainter,
     QPixmap,
+    QTextLayout,
+    QTextOption,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -463,6 +466,51 @@ class ClickableRow(QFrame):
         super().mouseReleaseEvent(event)
 
 
+def _name_font(pixel_size: int) -> QFont:
+    """Fuente del nombre de una tarjeta (la medimos y la aplicamos por código
+    para poder ajustar el texto al hueco disponible sin que se pise)."""
+    font = QFont("Segoe UI")
+    font.setPixelSize(pixel_size)
+    font.setWeight(QFont.Weight.DemiBold)
+    return font
+
+
+def _wrap_spans(text: str, font: QFont, width: int) -> list[tuple[int, int]]:
+    """Reparte `text` en líneas de como mucho `width` píxeles (por palabras y,
+    si una palabra no cabe sola, partiéndola). Devuelve (inicio, fin) de cada
+    línea sobre el texto original."""
+    if not text:
+        return []
+    layout = QTextLayout(text, font)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    layout.setTextOption(option)
+    spans: list[tuple[int, int]] = []
+    layout.beginLayout()
+    while True:
+        line = layout.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(max(width, 10))
+        spans.append((line.textStart(), line.textStart() + line.textLength()))
+    layout.endLayout()
+    return spans or [(0, len(text))]
+
+
+def _fit_lines(text: str, font: QFont, width: int, max_lines: int) -> tuple[list[str], bool]:
+    """Líneas listas para pintar: como mucho `max_lines`, y si el texto no
+    cabe entero, la última acaba en «…». Devuelve (líneas, recortado)."""
+    spans = _wrap_spans(text, font, width)
+    if max_lines <= 0:
+        return [], bool(text)
+    if len(spans) <= max_lines:
+        return [text[a:b].strip() for a, b in spans], False
+    lines = [text[a:b].strip() for a, b in spans[: max_lines - 1]]
+    rest = text[spans[max_lines - 1][0]:].strip()
+    lines.append(QFontMetrics(font).elidedText(rest, Qt.ElideRight, max(width, 20)))
+    return lines, True
+
+
 class TileWidget(QFrame):
     context_requested = Signal(dict, object)
     clicked_with_modifiers = Signal(dict, object)
@@ -534,6 +582,10 @@ class TileWidget(QFrame):
         outer.setSpacing(0)
 
         category_color = categories.get(item.get("category") or "")
+        self._stripe_h = 4 if category_color else 0
+        self._subtitle_full = ""
+        self._name_label: QLabel | None = None
+        self._content_layout = None
         if category_color:
             stripe = QFrame()
             stripe.setFixedHeight(4)
@@ -581,15 +633,20 @@ class TileWidget(QFrame):
             name_label = QLabel(item["name"])
             name_label.setObjectName("tileName")
             name_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            name_label.setFont(_name_font(12))
+            name_label.setMinimumWidth(10)
             layout.addWidget(name_label, stretch=1)
+            self._name_label = name_label
             self._build_favorite_star(size=14)
             self._update_favorite_visual()
+            self._fit_texts()
             return
 
         layout = QVBoxLayout(content)
         layout.setContentsMargins(10, 12, 10, 10)
         layout.setSpacing(2)
         layout.setAlignment(Qt.AlignHCenter)
+        self._content_layout = layout
 
         icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignCenter)
@@ -601,8 +658,10 @@ class TileWidget(QFrame):
         name_label = QLabel(item["name"])
         name_label.setObjectName("tileName")
         name_label.setAlignment(Qt.AlignCenter)
-        name_label.setWordWrap(True)
+        name_label.setFont(_name_font(12))
+        name_label.setWordWrap(False)  # las líneas las reparte _fit_texts
         layout.addWidget(name_label)
+        self._name_label = name_label
 
         # Se crea siempre que haga falta poder revelarla más tarde (por
         # ejemplo cuando el modo es "solo si está seleccionado"), aunque
@@ -620,10 +679,11 @@ class TileWidget(QFrame):
             subtitle_label = QLabel(subtitle_text)
             subtitle_label.setObjectName("tileSubtitle")
             subtitle_label.setAlignment(Qt.AlignCenter)
-            subtitle_label.setWordWrap(True)
+            subtitle_label.setWordWrap(False)  # las líneas las reparte _fit_texts
             subtitle_label.setVisible(bool(subtitle_text))
             layout.addWidget(subtitle_label)
             self._subtitle_label = subtitle_label
+            self._subtitle_full = subtitle_text
 
         layout.addStretch()
 
@@ -638,6 +698,100 @@ class TileWidget(QFrame):
 
         self._build_favorite_star(size=18)
         self._update_favorite_visual()
+        self._fit_texts()
+
+    def _set_subtitle(self, text: str) -> None:
+        if self._subtitle_label is None:
+            return
+        self._subtitle_full = text
+        self._fit_texts()
+
+    def _fit_texts(self) -> None:
+        """Ajusta nombre y subtítulo al tamaño real de la tarjeta para que
+        NUNCA se pisen con el icono ni entre sí. Orden de preferencia:
+        1) tamaño normal; 2) subtítulo a una línea; 3) letra algo más
+        pequeña (mínimo 10 px) y menos margen; 4) si aun así no cabe, se recorta con «…»
+        (el nombre completo sale al pasar el ratón)."""
+        name_label = getattr(self, "_name_label", None)
+        if name_label is None:
+            return
+        full_name = self.item.get("name", "")
+
+        if self.compact:
+            font = _name_font(12)
+            width = self.width() - 20 - (self._icon_px + 4) - 8 - 22
+            shown = QFontMetrics(font).elidedText(full_name, Qt.ElideRight, max(width, 20))
+            name_label.setText(shown)
+            self.setToolTip(full_name if shown != full_name else "")
+            return
+
+        width = max(self.width() - 24, 30)
+        total_h = self.height() - self._stripe_h
+        sub_text = self._subtitle_full if self._subtitle_label is not None else ""
+        sub_font = QFont(self.font())
+        sub_font.setPixelSize(9)
+        sub_lh = QFontMetrics(sub_font).lineSpacing()
+        sub_spans = _wrap_spans(sub_text, sub_font, width) if sub_text else []
+
+        icon_min = min(self._icon_px + 2, 36)
+        # (alto icono, margen sup., margen inf., letra del nombre, líneas máx. de subtítulo)
+        configs = [
+            (36, 12, 10, 12, 2), (36, 12, 10, 12, 1), (36, 12, 10, 11, 1),
+            (icon_min, 8, 6, 11, 1), (icon_min, 8, 6, 10, 1),
+            (icon_min, 6, 4, 10, 1),
+        ]
+
+        def sub_height(lines: int) -> int:
+            return lines * sub_lh + 2 if lines else 0
+
+        chosen = None
+        for icon_h, top, bottom, px, sub_cap in configs:
+            n_sub = min(len(sub_spans), sub_cap)
+            avail = total_h - top - bottom - icon_h - 2 - sub_height(n_sub)
+            font = _name_font(px)
+            lh = QFontMetrics(font).lineSpacing()
+            spans = _wrap_spans(full_name, font, width)
+            if len(spans) * lh + 2 <= avail:
+                chosen = (icon_h, top, bottom, px, n_sub)
+                break
+        if chosen is None:
+            icon_h, top, bottom, px, _cap = configs[-1]
+            n_sub = min(len(sub_spans), 1)
+            font = _name_font(px)
+            lh = QFontMetrics(font).lineSpacing()
+            avail = total_h - top - bottom - icon_h - 2 - sub_height(n_sub)
+            if (avail - 2) // lh < 1 and n_sub:
+                n_sub = 0  # sin hueco ni para una línea de nombre: el subtítulo se oculta
+                avail = total_h - top - bottom - icon_h - 2
+            chosen = (icon_h, top, bottom, px, n_sub)
+            max_name_lines = max(1, (avail - 2) // lh)
+        else:
+            max_name_lines = 99
+        icon_h, top, bottom, px, n_sub = chosen
+
+        font = _name_font(px)
+        lh = QFontMetrics(font).lineSpacing()
+        name_lines, name_cut = _fit_lines(full_name, font, width, max_name_lines)
+        name_label.setFont(font)
+        name_label.setText("\n".join(name_lines))
+        name_label.setFixedHeight(len(name_lines) * lh + 2)
+
+        sub_cut = False
+        if self._subtitle_label is not None:
+            if sub_text and n_sub:
+                sub_lines, sub_cut = _fit_lines(sub_text, sub_font, width, n_sub)
+            else:
+                sub_lines, sub_cut = [], bool(sub_text)
+            self._subtitle_label.setText("\n".join(sub_lines))
+            self._subtitle_label.setFixedHeight(sub_height(len(sub_lines)) or 0)
+            self._subtitle_label.setVisible(bool(sub_lines))
+
+        self._icon_label.setFixedHeight(icon_h)
+        self._content_layout.setContentsMargins(10, top, 10, bottom)
+        if name_cut or sub_cut:
+            self.setToolTip((full_name + ("\n" + sub_text if sub_text else "")).strip())
+        else:
+            self.setToolTip("")
 
     def _position_grip(self) -> None:
         if getattr(self, "_grip_label", None) is None:
@@ -691,6 +845,8 @@ class TileWidget(QFrame):
         self._position_grip()
         self._position_favorite_star()
         super().resizeEvent(event)
+        if event.oldSize() != event.size():
+            self._fit_texts()
 
     def _in_resize_zone(self, pos: QPoint) -> bool:
         if not self._resizable:
@@ -781,8 +937,7 @@ class TileWidget(QFrame):
             and self._path_display_mode == "on_select"
         ):
             text = self._path_text() if value else ""
-            self._subtitle_label.setText(text)
-            self._subtitle_label.setVisible(bool(text))
+            self._set_subtitle(text)
 
     def set_drop_highlight(self, value: bool) -> None:
         self.setProperty("dropTarget", "true" if value else "false")
@@ -1794,7 +1949,7 @@ class MainWindow(QMainWindow):
             QLabel#resizeGrip {{
                 color: {c['text_muted']}; font-size: 13px; background: transparent;
             }}
-            QLabel#tileName {{ color: {c['text']}; font-size: 12px; font-weight: 600; font-family: 'Segoe UI'; }}
+            QLabel#tileName {{ color: {c['text']}; }}
             QLabel#tileSubtitle {{ color: {c['text_muted']}; font-size: 9px; }}
             QLabel#sectionHeader {{
                 color: {c['text_muted']}; font-size: 11px; font-weight: 700; padding-bottom: 2px;
