@@ -1,0 +1,89 @@
+name: Compilar y publicar la app
+
+# Se ejecuta automáticamente cuando subes un tag de versión (ej. 2.1.1 o
+# v2.1.1, ambos valen), y también se puede lanzar a mano desde la pestaña
+# "Actions" de GitHub (botón "Run workflow"), sin necesitar un tag.
+on:
+  push:
+    tags:
+      - "v*"
+      - "*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Necesario para poder publicar el Release.
+
+jobs:
+  build:
+    # Máquina de Windows real proporcionada por GitHub: aquí sí se genera
+    # un .exe de Windows de verdad, a diferencia de compilar en Linux.
+    runs-on: windows-latest
+
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      # La release se publica con el número que haya en el archivo VERSION
+      # (no con el del tag). Si no coinciden, se para aquí para no dejar
+      # etiquetas sueltas ni una release con otro número del esperado.
+      # Si no quieres esta comprobación, borra este paso.
+      - name: Comprobar que el tag coincide con VERSION
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(tr -d '[:space:]' < VERSION)"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::El tag ($GITHUB_REF_NAME) no coincide con VERSION ($VER). Sube VERSION, haz commit y vuelve a etiquetar."
+            exit 1
+          fi
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Compilar la app (modo onedir)
+        run: pyinstaller main.spec
+
+      - name: Asegurar VERSION junto al ejecutable
+        shell: pwsh
+        run: Copy-Item VERSION dist/main/VERSION -Force
+
+      - name: Empaquetar la app en un .zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/main/* -DestinationPath AccesosDirectos.zip -Force
+
+      - name: Leer la versión desde VERSION
+        id: version
+        shell: bash
+        run: echo "value=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      # Crea latest.json con la versión y la suma SHA-256 del zip, FIRMADO con
+      # la clave privada guardada como secret (FIRMA_CLAVE_PRIVADA). Las apps
+      # solo instalan actualizaciones con esta firma. Si falta el secret o
+      # UPDATE_PUBLIC_KEY, este paso falla y NO se publica nada.
+      - name: Firmar la release (latest.json)
+        shell: bash
+        env:
+          FIRMA_CLAVE_PRIVADA: ${{ secrets.FIRMA_CLAVE_PRIVADA }}
+        run: >
+          python firmar_release.py
+          --version "${{ steps.version.outputs.value }}"
+          --zip AccesosDirectos.zip
+
+      - name: Publicar como Release en GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.value }}
+          files: |
+            AccesosDirectos.zip
+            latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
