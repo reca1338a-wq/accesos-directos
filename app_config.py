@@ -39,12 +39,20 @@ LEGACY_SHORTCUTS_PATH = APP_DIR / "shortcuts.json"
 #   "github"  GitHub Releases (repositorio público, o privado con token).
 #             Es el comportamiento de las versiones anteriores.
 # ---------------------------------------------------------------------------
-#UPDATE_SOURCE = "folder"
+UPDATE_SOURCE = "github"
 UPDATE_FOLDER = r"\\192.168.1.254\AccesosDirectos$"  # UPDATE_SOURCE = "folder"
 UPDATE_URL = ""  # UPDATE_SOURCE = "http", ej. "https://intranet.empresa.local/accesos/latest.json"
 UPDATE_HTTP_TOKEN = ""  # opcional: se envía como "Authorization: Bearer ..." en modo "http"
 
-UPDATE_SOURCE = "github"
+# Clave PÚBLICA (Ed25519, en base64) con la que se verifican las actualizaciones.
+# La genera `generar_claves.py` (una sola vez) y se pega aquí; la clave PRIVADA
+# nunca sale del PC de quien publica. Con la clave puesta, la app rechaza
+# cualquier actualización que no esté firmada con ella, aunque alguien consiga
+# escribir en la carpeta de red o publicar en GitHub. Vacía = sin verificación.
+# (A propósito NO se puede cambiar desde update_config.json.)
+UPDATE_PUBLIC_KEY = "BRkj2qnhNBQ5N9r3JtsYeaHPZ99/GZQosG1sFkqk75A="
+
+# UPDATE_SOURCE = "github" (heredado)
 GITHUB_OWNER = "reca1338a-wq"
 GITHUB_REPO = "accesos-directos"
 GITHUB_TOKEN = ""  # Déjalo vacío si el repositorio es público.

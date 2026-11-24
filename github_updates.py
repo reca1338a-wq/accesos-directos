@@ -13,6 +13,7 @@ cuyo auto-actualizador solo conoce los archivos listados en UPDATE_FILES.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,6 +36,8 @@ from app_config import (
     GITHUB_REPO,
     GITHUB_TOKEN,
     UPDATE_MANIFEST_NAME,
+    UPDATE_PUBLIC_KEY,
+    USER_DATA_DIR,
     VERSION_FILE,
     get_app_version,
     get_logger,
@@ -103,6 +107,132 @@ def is_newer_version(current: str, latest: str) -> bool:
     return parse_version(latest) > parse_version(current)
 
 
+# --- HTTPS: certificados -------------------------------------------------
+# En redes de empresa (proxy/antivirus que "inspecciona" HTTPS) o en equipos
+# sin los certificados raíz al día, el almacén de certificados que usa Python
+# por defecto falla con «CERTIFICATE_VERIFY_FAILED». Se prueban, por este
+# orden, dos formas de verificar (SIEMPRE verificando; nunca se desactiva
+# la comprobación, porque se descargan programas):
+#   1. `truststore`: usa la validación nativa de Windows (y sus raíces/GPO).
+#   2. El almacén por defecto de Python.
+# Opcional: un archivo `ca_bundle.pem` (certificado de la empresa) junto a la
+# app o en la carpeta de datos se añade al método 2.
+# Además, las actualizaciones van FIRMADAS (ver `verify_manifest_signature`):
+# aunque alguien interceptara la conexión, no podría colar un programa.
+
+_SSL_CONTEXTS: list | None = None
+
+
+def _extra_ca_file() -> str | None:
+    candidates = [Path(sys.executable).resolve().parent / "ca_bundle.pem"]
+    candidates.append(Path(USER_DATA_DIR) / "ca_bundle.pem")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            pass
+    return None
+
+
+def _ssl_contexts() -> list:
+    global _SSL_CONTEXTS
+    if _SSL_CONTEXTS is not None:
+        return _SSL_CONTEXTS
+    contexts: list = []
+    extra = _extra_ca_file()
+    try:
+        import truststore  # type: ignore[import-not-found]
+
+        contexts.append(truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    except Exception:  # noqa: BLE001 — opcional
+        pass
+    context = ssl.create_default_context()
+    if extra:
+        try:
+            context.load_verify_locations(extra)
+        except (OSError, ssl.SSLError):
+            pass
+    contexts.append(context)
+    _SSL_CONTEXTS = contexts
+    return contexts
+
+
+def _is_cert_error(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", exc)
+    return isinstance(reason, ssl.SSLCertVerificationError) or isinstance(exc, ssl.SSLCertVerificationError)
+
+
+def _urlopen(request, timeout: int):
+    """`urlopen` que, si falla la verificación del certificado, reintenta con
+    los demás métodos de verificación antes de rendirse."""
+    last_error: BaseException | None = None
+    for context in _ssl_contexts():
+        try:
+            return urllib.request.urlopen(request, timeout=timeout, context=context)
+        except urllib.error.URLError as exc:
+            if not _is_cert_error(exc):
+                raise
+            last_error = exc
+        except ssl.SSLCertVerificationError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def _connection_error_message(target: str, exc: BaseException) -> str:
+    if _is_cert_error(exc):
+        return (
+            f"No se pudo verificar el certificado de seguridad de {target}. "
+            "Suele pasar si la red de la empresa inspecciona el tráfico HTTPS (proxy/antivirus) "
+            "o si la fecha/hora del equipo es incorrecta. Pide a informática que añada el "
+            "certificado de la empresa, o guarda ese certificado como «ca_bundle.pem» junto "
+            f"a la aplicación. Detalle técnico: {getattr(exc, 'reason', exc)}"
+        )
+    return f"No se pudo conectar con {target}: {getattr(exc, 'reason', exc)}"
+
+
+# --- Firma de las actualizaciones (Ed25519) -------------------------------
+
+def manifest_signing_payload(manifest: dict) -> bytes:
+    """Los bytes exactos que se firman: el manifiesto sin su campo `signature`,
+    en JSON canónico. `publicar.py` y la app usan esta MISMA función."""
+    data = {key: value for key, value in manifest.items() if key != "signature"}
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def verify_manifest_signature(manifest: dict, public_key_b64: str | None = None) -> None:
+    """Comprueba que el manifiesto está firmado con la clave privada de quien
+    publica. Con clave pública configurada, un manifiesto sin firma o con firma
+    incorrecta se RECHAZA siempre. Sin clave configurada no se verifica (modo
+    heredado)."""
+    key_b64 = (UPDATE_PUBLIC_KEY if public_key_b64 is None else public_key_b64).strip()
+    if not key_b64:
+        return
+    signature = manifest.get("signature")
+    if not isinstance(signature, str) or not signature.strip():
+        raise UpdateError(
+            "La actualización no está firmada, así que no se instalará. "
+            "Quien publica debe usar publicar.py con su clave de firma."
+        )
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as exc:
+        raise UpdateError(
+            "Falta la librería «cryptography» para verificar la firma de la actualización."
+        ) from exc
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(key_b64))
+        public_key.verify(base64.b64decode(signature), manifest_signing_payload(manifest))
+    except (InvalidSignature, ValueError, TypeError) as exc:
+        get_logger().warning("Actualización RECHAZADA: la firma no es válida.")
+        raise UpdateError(
+            "La firma de la actualización NO es válida (el paquete no es de quien publica "
+            "o ha sido modificado). No se ha instalado nada."
+        ) from exc
+
+
 def _github_request(url: str, token: str = "") -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -113,7 +243,7 @@ def _github_request(url: str, token: str = "") -> dict:
 
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _urlopen(request, timeout=20) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -125,7 +255,7 @@ def _github_request(url: str, token: str = "") -> dict:
             ) from exc
         raise UpdateError(f"GitHub respondió con error {exc.code}.") from exc
     except urllib.error.URLError as exc:
-        raise UpdateError(f"No se pudo conectar con GitHub: {exc.reason}") from exc
+        raise UpdateError(_connection_error_message("GitHub", exc)) from exc
 
 
 # --- Orígenes privados (carpeta de red / servidor interno) ----------------
@@ -152,6 +282,7 @@ def _manifest_asset(manifest: dict) -> tuple[str, str]:
 
 
 def _info_from_manifest(manifest: dict, resolve_download, release_url: str, token: str) -> UpdateInfo | None:
+    verify_manifest_signature(manifest)  # primero la firma: nada más se mira si no es auténtico
     latest = str(manifest.get("version", "")).strip()
     if not latest:
         raise UpdateError("El manifiesto de actualización no indica la versión.")
@@ -196,7 +327,7 @@ def _http_json(url: str, token: str = "") -> dict:
         headers["Authorization"] = f"Bearer {token.strip()}"
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _urlopen(request, timeout=20) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -205,9 +336,7 @@ def _http_json(url: str, token: str = "") -> dict:
             raise UpdateError("No se encontró el manifiesto de actualizaciones en el servidor.") from exc
         raise UpdateError(f"El servidor de actualizaciones respondió con error {exc.code}.") from exc
     except urllib.error.URLError as exc:
-        raise UpdateError(
-            f"No se pudo conectar con el servidor de actualizaciones: {exc.reason}"
-        ) from exc
+        raise UpdateError(_connection_error_message("el servidor de actualizaciones", exc)) from exc
     except ValueError as exc:
         raise UpdateError("El manifiesto del servidor no es un JSON válido.") from exc
 
@@ -248,6 +377,9 @@ def _check_github(owner: str = "", repo: str = "", token: str = "") -> UpdateInf
     if not is_newer_version(current, latest):
         return None
 
+    if UPDATE_PUBLIC_KEY.strip():
+        return _check_github_signed(release, token)
+
     frozen = getattr(sys, "frozen", False)
     download_url = ""
 
@@ -278,6 +410,27 @@ def _check_github(owner: str = "", repo: str = "", token: str = "") -> UpdateInf
         download_url=download_url,
         token=token,
     )
+
+
+def _check_github_signed(release: dict, token: str) -> UpdateInfo | None:
+    """Release de GitHub con firma: debe llevar adjuntos el `latest.json`
+    firmado y los .zip que él nombra (los deja `publicar.py` en su carpeta)."""
+    assets = {str(a.get("name", "")): str(a.get("browser_download_url", "")) for a in release.get("assets", [])}
+    manifest_url = assets.get(UPDATE_MANIFEST_NAME, "")
+    if not manifest_url:
+        raise UpdateError(
+            f"La release no incluye «{UPDATE_MANIFEST_NAME}» (el archivo firmado). "
+            "Quien publica debe adjuntarlo junto a los .zip."
+        )
+    manifest = _http_json(manifest_url, token)
+
+    def resolve(name: str) -> str:
+        url = assets.get(name, "")
+        if not url:
+            raise UpdateError(f"La release no incluye el archivo «{name}» que indica el manifiesto.")
+        return url
+
+    return _info_from_manifest(manifest, resolve, release.get("html_url", ""), token)
 
 
 def cleanup_stale_update_files() -> None:
@@ -311,7 +464,7 @@ def _download_with_progress(request, destination: Path, progress_callback=None) 
     trozo leído; `total_bytes` es 0 si el servidor no manda
     Content-Length (raro, pero posible)."""
     chunk_size = 262144  # 256 KB
-    with urllib.request.urlopen(request, timeout=120) as response:
+    with _urlopen(request, timeout=120) as response:
         total = int(response.headers.get("Content-Length") or 0)
         downloaded = 0
         with destination.open("wb") as handle:

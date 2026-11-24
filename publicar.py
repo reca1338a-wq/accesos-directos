@@ -13,7 +13,10 @@ Qué hace:
      y AccesosDirectos-<versión>-source.zip (los .py, para instalaciones sin
      compilar).
   3. Calcula el SHA-256 de cada zip (la app lo verifica antes de instalar).
-  4. Copia los zip al destino y, POR ÚLTIMO, escribe latest.json de forma
+  4. FIRMA el manifiesto con tu clave privada (ver generar_claves.py): la app
+     solo instala actualizaciones firmadas, aunque alguien consiga escribir en
+     la carpeta o publicar en GitHub.
+  5. Copia los zip al destino y, POR ÚLTIMO, escribe latest.json de forma
      atómica: los clientes nunca ven una versión anunciada a medio subir.
 
 El destino es la carpeta (o carpeta servida por el servidor web interno) que
@@ -24,6 +27,8 @@ publica debe tener permiso de ESCRITURA en ella; los usuarios, solo lectura.
 from __future__ import annotations
 
 import argparse
+import base64
+import getpass
 import hashlib
 import json
 import os
@@ -35,12 +40,18 @@ import time
 import zipfile
 from pathlib import Path
 
-from app_config import UPDATE_MANIFEST_NAME, get_update_config
-from github_updates import UPDATE_FILES, parse_version
+from app_config import UPDATE_MANIFEST_NAME, UPDATE_PUBLIC_KEY, get_update_config
+from github_updates import (
+    UPDATE_FILES,
+    manifest_signing_payload,
+    parse_version,
+    verify_manifest_signature,
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DIST_DIR = PROJECT_DIR / "dist" / "main"
 PACKAGE_PREFIX = "AccesosDirectos-"
+DEFAULT_KEY_PATH = Path.home() / ".accesos-directos-firma" / "clave_privada.pem"
 
 
 def sha256_of(path: Path) -> str:
@@ -60,6 +71,38 @@ def build_exe() -> None:
         cwd=PROJECT_DIR,
         check=True,
     )
+
+
+def load_private_key(path: Path):
+    """Carga la clave privada de firma (pide la contraseña si la tiene)."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+    except ImportError:
+        sys.exit("Falta la librería «cryptography». Instálala con:  py -m pip install cryptography")
+    if not path.is_file():
+        sys.exit(
+            f"No encuentro la clave privada de firma en {path}.\n"
+            "Créala una sola vez con:  py generar_claves.py  (o indica otra con --clave)."
+        )
+    data = path.read_bytes()
+    password = os.environ.get("ACCESOS_FIRMA_CONTRASENA")
+    try:
+        return serialization.load_pem_private_key(data, password=password.encode() if password else None)
+    except TypeError:
+        pass  # está protegida con contraseña
+    except ValueError as exc:
+        sys.exit(f"No se pudo leer la clave privada: {exc}")
+    try:
+        return serialization.load_pem_private_key(
+            data, password=getpass.getpass("Contraseña de la clave de firma: ").encode("utf-8")
+        )
+    except ValueError:
+        sys.exit("Contraseña incorrecta (o clave dañada). No se ha publicado nada.")
+
+
+def sign_manifest(manifest: dict, private_key) -> None:
+    signature = private_key.sign(manifest_signing_payload(manifest))
+    manifest["signature"] = base64.b64encode(signature).decode("ascii")
 
 
 def zip_directory(directory: Path, destination: Path) -> None:
@@ -112,7 +155,26 @@ def main() -> None:
     parser.add_argument("--notes", default="", help="Texto breve con las novedades de esta versión.")
     parser.add_argument("--keep", type=int, default=3, help="Cuántas versiones conservar en el destino (defecto 3).")
     parser.add_argument("--force", action="store_true", help="Publicar aunque la versión no sea mayor que la ya publicada.")
+    parser.add_argument("--clave", default=os.environ.get("ACCESOS_CLAVE_PRIVADA", str(DEFAULT_KEY_PATH)),
+                        help="Clave privada de firma (por defecto ~/.accesos-directos-firma/clave_privada.pem).")
+    parser.add_argument("--sin-firmar", action="store_true",
+                        help="Publicar SIN firma (solo para apps compiladas sin UPDATE_PUBLIC_KEY; no recomendado).")
     args = parser.parse_args()
+
+    private_key = None
+    if args.sin_firmar:
+        if UPDATE_PUBLIC_KEY.strip():
+            sys.exit("UPDATE_PUBLIC_KEY está configurada: las apps rechazarían una actualización sin firma.")
+        print("AVISO: se publica SIN firma. Cualquiera con acceso de escritura al destino podría suplantarla.")
+    else:
+        if not UPDATE_PUBLIC_KEY.strip():
+            sys.exit(
+                "Aún no hay clave de firma configurada.\n"
+                "  1) Ejecuta una vez:  py generar_claves.py\n"
+                "  2) Pega la línea UPDATE_PUBLIC_KEY que muestra en app_config.py y recompila.\n"
+                "(O usa --sin-firmar si de momento no quieres firmar.)"
+            )
+        private_key = load_private_key(Path(args.clave))
 
     version = (PROJECT_DIR / "VERSION").read_text(encoding="utf-8").strip()
     dest_text = args.dest or get_update_config()["folder"]
@@ -172,6 +234,19 @@ def main() -> None:
         helper_path = PROJECT_DIR / helper
         if helper_path.exists():
             copy_atomic(helper_path, dest / helper)
+
+    if private_key is not None:
+        sign_manifest(manifest, private_key)
+        # Comprobación de seguridad: la firma debe validar con la clave pública
+        # que lleva la app; si no, esta clave privada no corresponde a esa app.
+        try:
+            verify_manifest_signature(manifest)
+        except Exception as exc:  # noqa: BLE001
+            sys.exit(
+                "La clave privada no corresponde con UPDATE_PUBLIC_KEY de app_config.py "
+                f"({exc}). No se ha publicado nada."
+            )
+        print("Manifiesto firmado y verificado.")
 
     manifest_tmp = work / UPDATE_MANIFEST_NAME
     manifest_tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

@@ -9,7 +9,8 @@ arrastrar y soltar, y auto-actualización **privada** desde la propia empresa.
 - `main.py` — la aplicación (interfaz, tarjetas, carpetas, drag&drop, configuración).
 - `app_config.py` — rutas, ajustes, modelo de datos y origen de las actualizaciones.
 - `github_updates.py` — comprobación e instalación de actualizaciones (carpeta de red, servidor interno o GitHub). El nombre se conserva por compatibilidad con instalaciones existentes.
-- `publicar.py` — herramienta para **publicar** una versión en la carpeta/servidor de la empresa.
+- `publicar.py` — herramienta para **publicar** (y firmar) una versión en la carpeta/servidor de la empresa.
+- `generar_claves.py` — crea una sola vez las claves de firma de las actualizaciones.
 - `win_icons.py` — iconos reales de Windows (vía `ctypes`) y miniaturas de imagen (Pillow).
 - `main.spec` — receta de PyInstaller (modo onedir).
 - `requirements.txt`, `iniciar.bat` / `iniciar.sh`, `VERSION`.
@@ -98,19 +99,39 @@ con un `update_config.json` junto al `.exe`:
 ### Error «CERTIFICATE_VERIFY_FAILED» al buscar actualizaciones
 
 Pasa en redes que inspeccionan HTTPS (proxy/antivirus de empresa) o en equipos sin los
-certificados raíz al día. La app prueba tres formas de verificar el certificado (siempre
-verificando, nunca se desactiva): `truststore` (certificados de Windows), `certifi` y el
-almacén de Python. Antes de compilar: `pip install -r requirements.txt`. Si aun así falla,
-guarda el certificado de la empresa (formato PEM) como `ca_bundle.pem` junto a la app y
-vuelve a probar. Revisa también que la fecha y hora del equipo sean correctas.
+certificados raíz al día (p. ej. un Windows 10 sin actualizar). La app verifica el
+certificado con `truststore` (certificados de Windows) y, si falla, con el almacén de
+Python; nunca se desactiva la verificación. Antes de compilar: `pip install -r requirements.txt`.
+Si aun así falla, guarda el certificado de la empresa (formato PEM) como `ca_bundle.pem`
+junto a la app, actualiza Windows y revisa que la fecha y hora del equipo sean correctas.
+
+### Actualizaciones firmadas (gratis)
+
+Cada versión se firma con una clave privada (Ed25519) que solo tienes tú; la app lleva
+la clave pública y **rechaza cualquier actualización sin firma o con firma incorrecta**,
+aunque alguien consiga escribir en la carpeta de red o publicar en GitHub.
+
+1. **Una sola vez**, en el PC desde el que publicas: `py -m pip install cryptography` y
+   `py generar_claves.py`. Guarda la clave privada (`~/.accesos-directos-firma/clave_privada.pem`)
+   con copia de seguridad y **no la subas a GitHub ni a la carpeta de red**. Si la pierdes,
+   las apps instaladas no aceptarán más actualizaciones.
+2. Pega la línea `UPDATE_PUBLIC_KEY = "..."` que muestra en `app_config.py` y recompila.
+3. Publica como siempre con `py publicar.py --build --notes "..."`: firma el `latest.json`
+   y comprueba la firma antes de publicar. Con otra clave: `--clave RUTA.pem`.
+4. **Si usas GitHub Releases** con la clave puesta, adjunta a la release los tres archivos que
+   deja `publicar.py` en la carpeta de destino: `AccesosDirectos-X.zip`,
+   `AccesosDirectos-X-source.zip` y `latest.json` (este último con ese nombre exacto).
+
+Limitación: la primera instalación con `instalar.bat` confía en la carpeta de red; la firma
+se comprueba en todas las actualizaciones posteriores.
 
 ### Seguridad (importante)
 
 Quien pueda escribir en la carpeta/servidor de actualizaciones puede ejecutar código en
 todos los PCs. Da permiso de **escritura solo a quien publica** y **solo lectura** al resto.
-El SHA-256 protege contra descargas dañadas, no contra alguien con acceso de escritura al
-manifiesto: si hace falta más garantía, firma el `.exe` (Authenticode) o despliega con
-Intune/SCCM.
+El SHA-256 protege contra descargas dañadas; lo que protege contra alguien con acceso de
+escritura es la **firma** (ver arriba). Activa además la verificación en dos pasos (2FA) en
+tu cuenta de GitHub.
 
 ## Desarrollo en Linux
 

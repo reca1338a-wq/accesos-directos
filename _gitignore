@@ -5,3 +5,4 @@ venv/
 settings.json
 build/
 dist/
+*.pem

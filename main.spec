@@ -14,17 +14,13 @@ try:
     datas += collect_data_files('PySide6', includes=['plugins/platforms/*', 'plugins/styles/*'])
 except Exception:
     pass
-try:
-    datas += collect_data_files('certifi')  # certificados raíz de respaldo para HTTPS
-except Exception:
-    pass
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['truststore', 'certifi'],
+    hiddenimports=['truststore', 'cryptography'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
