@@ -73,6 +73,10 @@ jobs:
         shell: bash
         env:
           FIRMA_CLAVE_PRIVADA: ${{ secrets.FIRMA_CLAVE_PRIVADA }}
+          # Solo si la clave se creó CON contraseña: guárdala como secret con este
+          # nombre. Si la clave no tiene contraseña, no hace falta crear el secret.
+          FIRMA_CONTRASENA: ${{ secrets.FIRMA_CONTRASENA }}
+          PYTHONUTF8: "1"  # para que los mensajes de error salgan con tildes
         run: >
           python firmar_release.py
           --version "${{ steps.version.outputs.value }}"
